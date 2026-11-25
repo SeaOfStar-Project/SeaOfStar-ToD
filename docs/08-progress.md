@@ -118,6 +118,110 @@ Proven:
   pipe gained `timeline`; `logs/menu-detect.py`, `logs/boot-watch.ps1` and
   `logs/load-save.ps1` automate title detection and the Load attempt.
 
+## Shader miss cost measured (2026-11-25)
+
+Proven (playtests `work\playtests\misscold-20261125-184058` and `misswarm-20261125-184328`; same
+timeline: load a late save slot, then about 40 s of walking; launcher graphics settings;
+`WII_RECOMP_ACTIVITY=1`). New runtime instrumentation logs `shader miss: kind=... shader_ms
+pipeline_ms total_ms` and a `prebake: ...` summary line.
+
+| Run | Misses | Detail |
+|---|---|---|
+| Cold (`WII_RECOMP_NO_SHADER_CACHE=1`, prebake skipped) | 71 | new-program n=42: median 8.0 ms, p90 18.5, max 127.5, sum 539 ms (shader build median 1.4 ms, `vkCreateGraphicsPipelines` median 6.7 ms). state-only n=29: median 0.0 ms, p90 6.0, max 10.8, sum 43 ms. |
+| Warm (normal; this PC's local caches warm: `stages.bin`/`pipelines.bin`, 700 pipelines) | 0 on the route | prebake recipes=373 programs=205 pipelines=700 in 20 ms; shader cache 293 stages / 700 pipelines loaded in 34 ms. |
+| Fresh cache (`WII_RECOMP_SHADER_CACHE` on a new empty folder, recipes on; `missfresh-20261125-184805`) | 0 on the route | `prebake: recipes=373 programs=205 pipelines=373 total_ms=212`: first-boot cost of building every recipe from the image, one-off at boot. |
+
+- Frames over 50 ms: cold 167, warm 154, fresh 180 (over 100 ms, cold vs warm: 8 vs 2). Proven: the count is nearly the
+  same with and without shader work, so on this route the >50 ms hitches are not explained by
+  shader misses. The counts include boot and loading.
+- Hypothesis: the slow-frame breakdown shows them outside stream, present, disc, audio and idle
+  (stream 0, present ~0.1 ms, idle a few ms), which would point at guest CPU or draw submission.
+  Not proven. This is the already-recorded unexplained scripted-route gap (Goal 2), not a new
+  finding.
+
+Caveats (hypothesis and limits): NVIDIA's driver shader disk cache was not bypassed (the
+`__GL_SHADER_DISK_CACHE_PATH` folder was never created), so the cold and fresh timings are lower
+bounds for a new machine. The route stays inside the starting house/workshop (screens from all three
+runs show the same scenes and the character moving), so coverage of outdoor areas is untested.
+State-only cost was measured on one NVIDIA GPU only. The near-zero state-only cost may
+reflect the warm driver cache.
+
+Conclusion: with the prebaked image a covered route has zero misses, both with warm local caches and with a
+fresh empty cache (212 ms one-off boot cost). The image prebake alone covers this route. State-only pipelines cost
+about 0 here, so dynamic state is not needed for stutter on this PC (recommendation; the user decides). Next
+priorities: (a) a map-sweep bot for coverage of new programs outdoors, since a new-program miss costs about 8 ms median and up to about 128 ms; and (b) the unexplained scripted-route hitch gap.
+
+Runtime change (uncommitted, branch `seaofstar-tod`): activity-gated miss logging and the prebake
+summary line.
+
+## Map sweep shader coverage (2026-11-25)
+
+Goal 4 (recipe coverage). Facts first, hypotheses marked.
+
+**Facts: tooling and reverse engineering**
+
+- Runtime (uncommitted, branch `seaofstar-tod`): control-pipe verbs `poke` and `call` plus a reply channel (`reply on`), an activity miss line that carries the recipe hash, and `tools\recipe-hashes.py` (prints the runtime's recipe hash for every record of a `shaders.bin`).
+- RE (REA, SO3EE9 USA): map manager at 0x805F9138; current map is `*(0x805F9144)+0xAC`; request words at +0x7E0 (new id), +0x7E4 (previous id), +0x7E8 (0xffffffff); post function 0x8012E234; getter 0x8000EE60. 265 valid IDs. Notes in `analysis/map-warp-notes.md` (gitignored).
+- First warp to ID 0 landed in Fenith Port, confirmed by a shot and by the getter.
+- `tools\map-sweep.py` generates the timelines (load slot 11, then warp through the IDs, 12.5 s per map).
+
+**Facts: sweep results**
+
+- Cold sweep of the 94 base maps (4 runs plus 1 repeat): 93 warped; ID 186 faults in guest code on load (skipped); 4xx/5xx IDs do not warp (progress variants).
+- 510 distinct recipes seen. 312 of the 373 manual recipes (84%) were rediscovered; 198 were new.
+- Coverage runs cov0-3 grew the shared `shaders.bin` from 373 to 550 (backup `shaders.bin.bak-20261125-pre-sweep`).
+- Image rebuilt with 550 recipes; `title.dll` recompiled too (profiled functions 15187). Setup state is current.
+- Verification with a fresh shader-cache folder on maps 0-33: prebake 550 recipes / 279 programs / 550 pipelines in 251 ms; 6 misses on the route (2 new-program, 4 state-only), against about 295 recipes that would need compiling cold.
+
+**Hypotheses (not proven)**
+
+- The 61 manual recipes the sweep did not rediscover come from battles, effects, menus and events.
+- The 6 residual misses vary with time of day and NPCs.
+
+**Next**
+
+- Repeat the sweep under other season, time, weather and progress-flag conditions; add battle content.
+- Saturation criterion: a full sweep under new conditions adds 0 recipes.
+
+## World-state and battle sweeps, 617 recipes (2026-11-26)
+
+Goal 4 (recipe coverage). Facts first, hypotheses marked. Run folders are under `work\playtests`.
+
+**Facts: reverse engineering** (`analysis\world-state-notes.md`, `analysis\battle-notes.md`, both gitignored)
+
+- Calendar object: `P = *(0x805EAA48)`. Season, week, day, weekday and hour bytes were validated live; weather is at `P+0x64`; the clock-speed word at `0x805EAA94` freezes time when set.
+- Festival flags 0x346..0x356 are derived from the date and have no storage. Setting the date triggers a festival; poking the flag does not.
+- The flag setter only works for flags that have set scripts (event-flag attempt added 1 recipe; flags are effectively read-only).
+- The direct monster factory at 0x80075e0c blocks (it waits on a load), so calling it through the pipe is unsafe. Natural spawns in dungeon maps are used instead; the dungeon maps with natural enemies are listed in `battle-notes.md`.
+- Festival event ids were confirmed by `call 8021ae40`.
+- Harness additions: timeline variables (`-> NAME`, `$NAME+off`), `call` with r3..r10, `pokef`.
+
+**Facts: sweeps** (coverage runs, or `-Sweep -Parallel` merged with `tools\merge-recipes.py`)
+
+| Step | Recipes after |
+|---|---|
+| Start (2026-11-25 map sweep) | 550 |
+| Seasons spring/summer/winter/night at 10:00 and 20:00 over 93 maps | 557, 567, 572, 580 |
+| Weather 1-4 on 20 outdoor maps | 582 |
+| Dusk 17:00 | 593 |
+| Event-flag attempt | +1 |
+| Festival dates: 17 festivals x maps 0-9 | +12 |
+| Dungeon battle sweep, 40 maps with attacks (magic and damage numbers visible in shots) | +12 |
+| Merged total | 617 |
+
+- Profile: 15540 functions. Image rebuilt with 617 recipes; setup state current.
+- Parallel: 3 windowless instances ran fine on this PC (CPU ~91%, GPU 57%, VRAM 1.5 of 6 GB, free RAM ~10.7 GB), about 3x faster. Frame times are not taken from parallel runs.
+- Verification with fresh shader-cache folders, 3 parallel runs: prebake 617 recipes / 296 programs / 617 pipelines in 314-381 ms (under parallel load). Misses: maps (spring, 24 maps) 4 (max 1.49 ms); festival (57 warps) 1 (1.98 ms); battle (13 dungeons) 0.
+
+**Facts: tooling.** Ghidra-GameCube-Loader built from master for Ghidra 12.2 (a local `tools/wii-re` folder outside the repository); decomp-toolkit 1.9.1 named 358 SDK functions. REA opens the ELF wrapper, but its Windows Ghidra decompiler rejects non-PE.
+
+**Hypotheses (not proven)**
+
+- The remaining recipes come from unseen monster types, spells, weapons, cutscenes and menus.
+- The total is likely hundreds to about 1000, not tens of thousands (fixed-function GX).
+
+**Next:** more content (other monsters, spells, weapons, cutscenes, menus); saturation criterion unchanged (a full sweep under new conditions adds 0 recipes).
+
 ## Open
 
 | Item | State |

@@ -15,6 +15,7 @@
 #include "debug.h"
 #include "dsp.h"
 #include "hardware.h"
+#include "input.h"
 #include "vi.h"
 #include "net.h"
 
@@ -138,6 +139,7 @@ void poll_interrupts(void) {
   audio_update(now);
   hardware_update(now);
   floating_point_exceptions_check();
+  control_service();  // A poke or call from the control pipe, before an interrupt could be taken.
   if (!(cpu.msr & INTERRUPTS_ENABLED)) { interrupt_polls_masked++; return; }
   if (irq_pending()) {
     interrupts_taken++;

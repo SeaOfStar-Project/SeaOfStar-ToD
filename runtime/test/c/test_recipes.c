@@ -29,6 +29,9 @@ int gx_shader_recipe(GxShader program, const GxRenderState *state, GxRecipe *rec
   return 1;
 }
 
+unsigned gx_pipeline_total;
+unsigned gx_shader_program_count(void) { return 0; }
+
 static unsigned prepared = 0, prepared_names = 0;
 void gx_shader_prepare(const GxRecipe *recipes, unsigned count) {
   prepared = count;

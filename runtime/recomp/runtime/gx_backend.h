@@ -176,6 +176,7 @@ void gx_shader_prepare(const GxRecipe *recipes, unsigned count);
 // gx_recipes.c: what a title has drawn with, kept between runs. The backend tells it of
 // each pipeline it builds; once the backend has started, everything kept is built.
 void gx_recipe_note(GxShader shader, const GxRenderState *state);
+int gx_recipe_hash(GxShader shader, const GxRenderState *state, uint32_t *hash);
 void gx_recipes_start(void);
 
 extern const GxBackend *gx_backend;

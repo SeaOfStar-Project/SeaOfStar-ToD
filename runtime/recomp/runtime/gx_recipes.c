@@ -132,7 +132,11 @@ static double seconds_now(void) {
 }
 
 void gx_recipes_start(void) {
-  if (getenv("WII_RECOMP_NO_SHADER_CACHE") || !title) return;
+  if (getenv("WII_RECOMP_NO_SHADER_CACHE")) {
+    fprintf(stderr, "prebake: skipped (WII_RECOMP_NO_SHADER_CACHE)\n");
+    return;
+  }
+  if (!title) return;
   char path[4096];
   if (!title_data_path("shaders.bin", path, sizeof path)) return;
   size_t bytes = 0, carried_bytes = 0;
@@ -149,8 +153,19 @@ void gx_recipes_start(void) {
   if (!recipe_count) return;
   double start = seconds_now();
   gx_shader_prepare(recipes, recipe_count);
-  fprintf(stderr, "shader recipes: %u ready in %.0f ms (%d from the disc)\n", recipe_count, (seconds_now() - start) * 1000,
-          from_disc > 0 ? from_disc : 0);
+  double milliseconds = (seconds_now() - start) * 1000;
+  fprintf(stderr, "shader recipes: %u ready in %.0f ms (%d from the disc)\n", recipe_count, milliseconds, from_disc > 0 ? from_disc : 0);
+  fprintf(stderr, "prebake: recipes=%u programs=%u pipelines=%u total_ms=%.0f\n", recipe_count, gx_shader_program_count(), gx_pipeline_total,
+          milliseconds);
+}
+
+// The recipe's hash as tools/recipe-hashes.py prints it, for logs; 0 if the program isn't
+// one a recipe names. Works with the shader cache off too.
+int gx_recipe_hash(GxShader shader, const GxRenderState *state, uint32_t *hash) {
+  GxRecipe recipe;
+  if (!gx_shader_recipe(shader, state, &recipe)) return 0;
+  *hash = hash_recipe(&recipe);
+  return 1;
 }
 
 void gx_recipe_note(GxShader shader, const GxRenderState *state) {

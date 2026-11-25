@@ -26,4 +26,6 @@ void debug_poll(uint64_t seconds_running);
 
 // Says once, by name and value, that the graphics code met something it doesn't do, and
 // counts it under its row ID in docs/hardware_inventory.md (see gaps.h).
+// True when WII_RECOMP_ACTIVITY is set: the once-a-second line and one line per shader or pipeline miss.
+int debug_activity_on(void);
 void debug_unsupported(const char *id, const char *what, uint32_t value);

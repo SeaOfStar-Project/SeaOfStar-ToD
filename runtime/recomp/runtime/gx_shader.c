@@ -32,6 +32,8 @@ typedef struct {
 // named by its keys (gx_recipes.c). Only searched when something new is built.
 static struct { unsigned program; ProgramKey key; } *built;
 static unsigned built_count, built_capacity;
+double gx_miss_program_ms;
+unsigned gx_miss_programs, gx_pipeline_total;
 static int preparing;  // Building the recipes before the first picture, not on demand.
 
 static Cache fragment_shaders = {.key_bytes = sizeof(FragmentKey)}, vertex_shaders = {.key_bytes = sizeof(VertexKey)};
@@ -115,7 +117,11 @@ static unsigned build_program(const ProgramKey *key) {
   unsigned program = gx_backend->shader_link(vertex_shader(&key->vertex), fragment_shader(&key->fragment));
   float milliseconds = (float)((glfwGetTime() - start) * 1000);
   if (preparing) gx_stats.prepared_shaders++;
-  else gx_stats.new_shaders++;
+  else {
+    gx_stats.new_shaders++;
+    gx_miss_program_ms += milliseconds;  // Reported with the pipeline this program needs (gx_vulkan_pipeline.c).
+    gx_miss_programs++;
+  }
   if (milliseconds > gx_stats.slowest_shader_ms) gx_stats.slowest_shader_ms = milliseconds;
   if (built_count == built_capacity) {
     built_capacity = built_capacity ? built_capacity * 2 : FIRST_SLOTS;
@@ -134,6 +140,8 @@ static unsigned program_for(const ProgramKey *key) {
   }
   return program;
 }
+
+unsigned gx_shader_program_count(void) { return built_count; }
 
 int gx_shader_recipe(GxShader program, const GxRenderState *state, GxRecipe *recipe) {
   for (unsigned i = built_count; i-- > 0;) {

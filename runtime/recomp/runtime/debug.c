@@ -69,6 +69,12 @@ void debug_unsupported(const char *id, const char *what, uint32_t value) {
   fprintf(stderr, "unsupported graphics: %s = 0x%x (%s)\n", what, value, id);
 }
 
+int debug_activity_on(void) {
+  static int enabled = -1;
+  if (enabled < 0) enabled = getenv("WII_RECOMP_ACTIVITY") != 0;
+  return enabled;
+}
+
 static void report_activity(uint64_t second) {
   static uint64_t last;
   static int enabled = -1;

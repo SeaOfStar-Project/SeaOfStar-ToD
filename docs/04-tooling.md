@@ -286,6 +286,8 @@ currently; it needs a MinGW/Clang environment. Treat it as a reference, not the 
 tools\playtest.ps1 -Tag boot1 -Seconds 240 -Every 5             # boot, a picture every 5 s
 tools\playtest.ps1 -Tag loadprobe -Script logs\loadprobe.txt     # timeline, same format as play-script.ps1
 tools\playtest.ps1 -Tag cov -Coverage -Seconds 600              # writes the shared title-data
+tools\playtest.ps1 -Tag sweepA -Sweep -Parallel -Script work\sweep\cov0.txt   # up to 3 at once, own title-data copy each
+python tools\merge-recipes.py --dry-run work\playtests\sweepA-* work\playtests\sweepB-*   # then without --dry-run (nothing running)
 tools\playtest.ps1 -Tag x -DryRun                               # all checks + plan, starts nothing
 tools\playtest.ps1 -Tag tree1 -Tree -Seconds 60                 # boot the extracted tree + WII_RECOMP_NATIVE like the launcher
 tools\playtest.ps1 -Tag idle1 -Seconds 70 -NoControl            # no control pipe (idle run, no shots or script)
@@ -307,6 +309,65 @@ process tree is killed and the lock released in a `finally` block, also on Ctrl+
 hardened: the `finally` block can no longer throw, the lock is always released, and the original
 error is printed.
 
+**Pipe replies and memory verbs.** The runtime's control pipe is two-way on Windows. The script
+sends `reply on` first; the runtime then answers every command with exactly one line (`ok ...` or
+`error ...`). The script prints it as `  < <reply>` under each `  > verb` line and appends
+`time<TAB>command<TAB>reply` to `<run>\pipe.log` (`<no reply>` after 2 s; `<replies off>` if
+the runtime is too old to answer `reply on`). Verbs for looking into the game, all numbers hex:
+`peek <addr> <words>` (reply: the words on one line), `poke <addr> <1|2|4> <value>` (writes
+big-endian guest memory, same address form as `peek`, MEM1 and MEM2 only; logs
+`control: poke 0x... w=4 old=0x... new=0x...` to stderr) `pokef <addr> <float>` (writes a 32-bit big-endian IEEE float, decimal
+value, same checks and `control: pokef ...` log as `poke`; handy for positions) and
+`call <addr> [r3 .. r10]` (runs the translated guest function at `<addr>` with up to 8 hex arguments
+in r3 to r10, replies `ok call <addr> r3=<result>`,
+logs `control: call ...`; an address with no translated function is an error). `poke` and `call`
+run on the game's thread at its next interrupt check (a few milliseconds), and the reply comes
+after. `call` runs only while the game has interrupts on, with them off during the call, on the
+stack below r1, and puts the whole processor state back afterwards. It can't call a function
+that waits, sleeps or switches threads: it would never return, the reply is `error ... did not
+return` and the log says the context switched. Calling is safe only for short leaf-like
+functions (getters, flag setters).
+
+**Timeline variables.** A timeline line may end with `-> NAME` to keep a value from its reply: for
+`call` the result r3, for `peek` the first word (further words as `NAME_1`, `NAME_2`, ...). Later
+arguments may use `$NAME`, `$NAME+0x34` or `$NAME-8` (an offset with `0x` is hex, a bare one is
+decimal; 32-bit wrap-around); each is replaced before sending by 8-digit lowercase hex without `0x`,
+like the addresses written by hand. The substituted command is what is printed and written to
+`pipe.log`. A line that uses a variable nothing captured (or whose capture failed) logs an error,
+is not sent, and the timeline goes on. `-DryRun` lists the lines that use variables unsubstituted
+and warns about uses with no earlier capture. Example:
+`10 call 80123456 -> OBJ`, `11 pokef $OBJ+0x34 1.5`.
+
+**Map sweep and recipe hashes (shader coverage).** `tools\map-sweep.py` writes playtest
+timelines that load a save and warp through map IDs with the `poke`/`call` verbs (12.5 s per
+map; the addresses are SO3EE9 (USA) specific; 4xx/5xx IDs do not warp, ID 186 is skipped). Usage:
+
+```powershell
+python tools\map-sweep.py --out work\sweep                  # cov0.txt .. cov3.txt, 24 maps each
+python tools\map-sweep.py --chunk 0                          # one chunk to stdout
+python tools\map-sweep.py --ids 0-9,20,30-33 --out work\sweep  # custom IDs; --prefix FILE swaps the save-loading prefix
+copy work\wii-recomp\recomp\build\title-data\00010000-534f3345\shaders.bin shaders.bin.bak   # -Coverage writes the shared file: back it up first
+tools\playtest.ps1 -Tag cov0 -Coverage -Script work\sweep\cov0.txt
+python tools\recipe-hashes.py shaders.bin                    # recipe hash per record, matches "recipe=<8 hex>" in miss logs
+```
+
+Rebuild the packed image afterwards (`shaders.bin` newer than the image makes Play fall back to
+the extracted tree). Results: `docs/08-progress.md`, "Map sweep shader coverage".
+
+**Parallel sweeps and offline merge.** Shader-coverage sweeps may run up to 3 windowless instances in parallel with `tools\playtest.ps1 -Sweep -Parallel`; each writes its own title-data copy, merged afterwards with `tools\merge-recipes.py`; frame-time measurements are never taken from parallel runs (user decision 2026-11-25).
+`-Parallel` requires `-Sweep` and is refused with `-Coverage`, `-Every > 0` and `-Window`. It takes the first free
+`work\playtest-slot-<N>.lock` (PID, tag, start, mode, child `wii-recomp.exe` PID; stale by PID like the main lock),
+is refused while the exclusive `work\playtest.lock` is held, and a normal run is refused while any slot lock is live. Only
+`wii-recomp.exe`/`playtest.ps1` processes that belong to a live slot lock are tolerated; ninja, clang, the launcher and
+any other game still refuse. `-Sweep` alone is a normal exclusive run that also writes only its own copy. Each run's recipes
+accumulate in `<run>\title-data\00010000-534f3345\shaders.bin`; the shared `shaders.bin`/`profile.txt` are never
+written by a sweep. `tools\merge-recipes.py <run folders...>` folds them in: header (magic, version, record bytes,
+title) must match, records are deduplicated by the FNV-1a recipe hash (as `recipe-hashes.py`), new ones are appended in
+order, written atomically after a `.bak-<stamp>-merge` backup, and it prints before/candidates/new/after.
+`profile.txt` is merged as a union of functions with the maximum count (each run copy already holds the shared counts,
+so summing would double count them); another program hash or an unparsable line skips it. It refuses while a
+`wii-recomp.exe` or a playtest lock is live (`--dry-run` only reads; `--target-dir` merges into a copy for tests).
+
 **Graphics settings.** By default a run reads `config\launcher.ini` `[options]` (fsr, sharpness,
 scale, window, present; fullscreen ignored) and sets the same `WII_RECOMP_*` variables as the
 launcher (scale 1.5 -> `3/2`, 2.5 -> `5/2`, else a whole number). `-Scale <s>` overrides the
@@ -326,3 +387,5 @@ with `-NoControl` 19.1 (p95 35.7), a difference within run-to-run noise; scale 1
 settings 28.3 (p95 38.8), so below 1.5 the scale no longer matters; live vs fresh `shared2` 81.3 vs
 82.6 (no effect). Open: idle runs sit on the opening movie and attract loop, so they are not
 like-for-like with free play.
+
+**World-state sweep recipe (2026-11-26).** To collect recipes per condition without playing: load a save, then poke the calendar object `P = *(0x805EAA48)` (season, week, day, weekday, hour bytes; weather at `P+0x64`; the word at `0x805EAA94` freezes the clock) and warp through the maps (`tools\map-sweep.py` timelines; timeline variables `-> NAME` and `$NAME+off` carry addresses between lines). Conditions used: seasons x 10:00/20:00 over 93 maps, weather 1-4 on 20 outdoor maps, dusk 17:00. Festivals are derived from the date (flags 0x346..0x356 have no storage): set the date, then warp, and confirm the event id with `call 8021ae40`. The flag setter works only for flags with set scripts. Battle sweep: warp to dungeon maps with natural enemies (`analysis\battle-notes.md`) and attack with button presses so magic and damage numbers render; never `call` the monster factory at 0x80075e0c (it blocks). Run with `-Sweep -Parallel` (up to 3), merge with `tools\merge-recipes.py` when nothing runs, rebuild the image. Verify with fresh shader-cache folders (3 parallel runs): 2026-11-26 result was prebake 617 recipes / 296 programs / 617 pipelines in 314-381 ms, with 4, 1 and 0 misses on the spring-maps, festival and battle routes. Growth 550 -> 617 is in docs/08-progress.md.

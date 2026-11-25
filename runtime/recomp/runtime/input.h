@@ -106,6 +106,8 @@ void input_board_now(double kilograms[4]);
 
 // The control pipe (control_pipe.c): one command a line, from a script or another program.
 void input_start_control_pipe(const char *path);
+void control_service(void);     // On the game's thread, at an interrupt check: does a queued poke or call (control_pipe.c).
+int control_call_active(void);  // 1 while a call from the control pipe runs.
 int input_run_command(const char *line);  // 0 for a line it doesn't know. Exposed for tests.
 
 // Replace KPADRead and WPADProbe in the game's code (input_direct.c).

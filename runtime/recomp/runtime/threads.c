@@ -8,6 +8,7 @@
 #endif
 
 #include "cpu.h"
+#include "input.h"
 
 // OSContext layout in guest memory.
 enum {
@@ -358,6 +359,7 @@ static void start_fresh(Slot *slot, uint32_t pc) {
 #endif
 
 void load_context(void) {
+  if (control_call_active()) fprintf(stderr, "control: a call from the control pipe switched guest context (%08x, from %08x): it will not return\n", cpu.r[3], cpu.lr);
   uint32_t c = cpu.r[3];
   uint32_t pc = rd32(c + CONTEXT_SRR0);
   if (!pc) {

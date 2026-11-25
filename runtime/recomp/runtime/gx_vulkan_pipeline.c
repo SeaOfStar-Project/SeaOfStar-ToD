@@ -649,7 +649,21 @@ static VkPipeline vk_pipeline_find_new(GxShader shader, const GxRenderState *sta
     // A new pipeline holds up the draw as a new shader does, so it counts as one.
     float milliseconds = (float)((seconds_now() - start) * 1000);
     gx_stats.new_pipelines++;
+    gx_pipeline_total = pipeline_count;
     if (milliseconds > gx_stats.slowest_shader_ms) gx_stats.slowest_shader_ms = milliseconds;
+    if (debug_activity_on()) {
+      // A program built since the last miss was reported means this pipeline is for a new program.
+      double shader_ms = gx_miss_program_ms;
+      uint32_t recipe_hash = 0;
+      int has_recipe = gx_recipe_hash(shader, state, &recipe_hash);
+      char recipe_text[16] = "none";
+      if (has_recipe) snprintf(recipe_text, sizeof recipe_text, "%08x", recipe_hash);
+      fprintf(stderr, "shader miss: kind=%s shader_ms=%.2f pipeline_ms=%.2f total_ms=%.2f programs=%u pipelines=%u recipe=%s\n",
+              gx_miss_programs ? "new-program" : "state-only", shader_ms, (double)milliseconds, shader_ms + (double)milliseconds,
+              gx_shader_program_count(), pipeline_count, recipe_text);
+    }
+    gx_miss_program_ms = 0;
+    gx_miss_programs = 0;
     if (pipelines_file) {
       fwrite(&key, sizeof key, 1, pipelines_file);
       fflush(pipelines_file);
@@ -718,6 +732,7 @@ static int build_many(PipelineKey *keys, int count, int write_down) {
     if (write_down && pipelines_file) fwrite(&keys[i], sizeof keys[i], 1, pipelines_file);
   }
   if (write_down && pipelines_file) fflush(pipelines_file);
+  gx_pipeline_total = pipeline_count;
   free(batch_built);
   batch_built = 0;
   return wanted;

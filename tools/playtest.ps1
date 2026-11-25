@@ -16,6 +16,13 @@
   'stick x y' moves the Nunchuk stick and the Classic Controller's left stick together,
   like the keyboard's WASD (menus read the Nunchuk stick).
   'gshot' is accepted as an alias of 'shot'.
+  Every command's reply is read from the control pipe (the runtime answers one line each after
+  "reply on", which the script sends first), printed as "  < reply" under its "  > verb" line and
+  appended to <run>\pipe.log (time, command, reply; "<no reply>" after 2 s). The memory verbs:
+  'peek <addr-hex> <words>', 'poke <addr-hex> <1|2|4> <value-hex>', 'call <addr-hex> [r3 .. r10]' (up to 8 args),
+  'pokef <addr-hex> <float>'. Variables: end a line with '-> NAME' to keep the reply's value (call: r3;
+  peek: first word, NAME_1.. for more); later arguments may use $NAME, $NAME+0x34, $NAME-8 (0x = hex, bare =
+  decimal offset), substituted as 8-digit lowercase hex. An unknown variable logs an error and skips the line.
 
 .EXAMPLE
   tools\playtest.ps1 -Tag boot1 -Seconds 240 -Every 5
@@ -30,6 +37,17 @@
 
   -NoControl does not set WII_RECOMP_CONTROL and opens no pipe (input/mouse behave as from the
   launcher); it is refused together with -Script or -Every > 0.
+
+  -Sweep marks a shader-coverage sweep that writes only its own title-data copy (never the shared
+  shaders.bin/profile.txt; merge afterwards with tools\merge-recipes.py). It is refused together with
+  -Coverage. Without -Parallel it is a normal exclusive run.
+
+  -Parallel (only with -Sweep; refused with -Coverage, -Every > 0 and -Window) takes one of three slot
+  locks work\playtest-slot-<N>.lock instead of work\playtest.lock, so up to 3 windowless sweep runs can
+  play at once. It is refused while the exclusive lock is held, and an exclusive run is refused while
+  any slot lock is live. Other wii-recomp.exe / playtest.ps1 processes are tolerated only when they
+  belong to a live slot lock (child PID recorded in the lock, or a child of the lock's owner).
+  Frame-time measurements are never taken from parallel runs (user decision 2026-11-25).
 
   -Tree boots the extracted disc tree (extracted\SO3EE9\sys) with the loose title.dll
   (WII_RECOMP_NATIVE), exactly like the launcher does when it does not use the packed image.
@@ -47,6 +65,8 @@ param(
     [string]$Scale,
     [switch]$RuntimeDefaults,
     [switch]$NoControl,
+    [switch]$Sweep,
+    [switch]$Parallel,
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
@@ -61,7 +81,10 @@ $buildDir = Join-Path $root 'work\wii-recomp\recomp\build'
 $pristineRoot = Join-Path $buildDir 'saves\pristine'
 $sharedTitleData = Join-Path $buildDir 'title-data'
 $liveShared2 = Join-Path $buildDir 'saves\shared2'
-$lockPath = Join-Path $root 'work\playtest.lock'
+$mainLockPath = Join-Path $root 'work\playtest.lock'
+$lockPath = $mainLockPath
+$slotCount = 3
+$slotPaths = @(1..$slotCount | ForEach-Object { Join-Path $root "work\playtest-slot-$_.lock" })
 $titleId = '00010000-534f3345'
 $saveRel = 'title\00010000\534f3345\data'
 
@@ -73,6 +96,10 @@ function Fail([string]$msg, [int]$code = 2) {
 }
 
 # ---- static checks -------------------------------------------------------------------------
+if ($Parallel -and -not $Sweep) { Fail '-Parallel is only allowed together with -Sweep' }
+if ($Sweep -and $Coverage) { Fail '-Sweep writes its own title-data copy; it cannot be combined with -Coverage (shared shaders.bin)' }
+if ($Parallel -and $Every -gt 0) { Fail '-Parallel cannot be combined with -Every > 0 (parallel runs are windowless sweeps; no periodic pictures)' }
+if ($Parallel -and $Window) { Fail '-Parallel cannot be combined with -Window (parallel runs are always windowless)' }
 if ($NoControl -and $Script) { Fail '-NoControl cannot be combined with -Script (no control pipe, so a timeline cannot be played)' }
 if ($NoControl -and $Every -gt 0) { Fail '-NoControl cannot be combined with -Every > 0 (no control pipe, so shots cannot be taken)' }
 $needs = if ($Tree) { @($exe, $discTree, $titleDll) } else { @($exe, $image) }
@@ -81,6 +108,49 @@ foreach ($need in $needs) {
 }
 if (-not $Coverage -and -not (Test-Path -LiteralPath (Join-Path $sharedTitleData $titleId))) {
     Fail "no title-data to copy at $sharedTitleData\$titleId"
+}
+
+# Timeline variables: a line ending in "-> NAME" stores the reply's value (call: r3; peek: first word,
+# then NAME_1, NAME_2 for further words); later arguments may use $NAME, $NAME+0x34, $NAME-8
+# (0x = hex offset, bare = decimal), replaced by 8-digit lowercase hex without 0x.
+$script:tlVars = New-Object 'System.Collections.Generic.Dictionary[string,uint32]'
+$script:tlVarPattern = '\$([A-Za-z_][A-Za-z0-9_]*)(?:([+-])(0[xX][0-9A-Fa-f]+|[0-9]+))?'
+
+function Expand-Vars([string]$text) {
+    $missing = New-Object System.Collections.Generic.List[string]
+    $out = [regex]::Replace($text, $script:tlVarPattern, {
+        param($m)
+        $name = $m.Groups[1].Value
+        if (-not $script:tlVars.ContainsKey($name)) { [void]$missing.Add($name); return $m.Value }
+        [uint64]$v = $script:tlVars[$name]
+        if ($m.Groups[2].Success) {
+            $o = $m.Groups[3].Value
+            [uint64]$off = if ($o -match '^0[xX]') { [Convert]::ToUInt64($o.Substring(2), 16) } else { [uint64]$o }
+            if ($m.Groups[2].Value -eq '+') { $v = ($v + $off) -band 0xFFFFFFFFL } else { $v = ($v + 0x100000000L - ($off -band 0xFFFFFFFFL)) -band 0xFFFFFFFFL }
+        }
+        return ('{0:x8}' -f [uint32]$v)
+    })
+    return [pscustomobject]@{ Text = $out; Missing = @($missing | Select-Object -Unique) }
+}
+
+function Get-VarNames([string]$text) {
+    return @([regex]::Matches($text, $script:tlVarPattern) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+}
+
+# Stores the values of one reply under NAME (peek words also under NAME_1, NAME_2, ...). Returns what was stored.
+function Set-Captures([string]$name, [string]$verb, [string]$reply) {
+    $vals = @()
+    if ($reply) {
+        if ($verb -eq 'call' -and $reply -match '^ok call \S+ r3=([0-9A-Fa-f]{1,8})\b') { $vals = @($Matches[1]) }
+        elseif ($verb -eq 'peek' -and $reply -match '^ok peek \S+?:\s*(.*)$') { $vals = @($Matches[1] -split '\s+' | Where-Object { $_ -match '^[0-9A-Fa-f]{1,8}$' }) }
+    }
+    $stored = @()
+    for ($i = 0; $i -lt $vals.Count; $i++) {
+        $n = if ($i -eq 0) { $name } else { "${name}_$i" }
+        $script:tlVars[$n] = [Convert]::ToUInt32($vals[$i], 16)
+        $stored += ('{0}={1:x8}' -f $n, $script:tlVars[$n])
+    }
+    return $stored
 }
 
 # Timeline
@@ -93,6 +163,8 @@ if ($Script) {
     foreach ($line in Get-Content -LiteralPath $scriptPath) {
         $trim = $line.Trim()
         if (-not $trim -or $trim.StartsWith('#')) { continue }
+        $capture = $null
+        if ($trim -match '^(.*?)\s*->\s*([A-Za-z_][A-Za-z0-9_]*)$') { $trim = $Matches[1]; $capture = $Matches[2] }
         $parts = $trim -split '\s+', 3
         if ($parts.Count -lt 2) { Fail "bad timeline line: $line" }
         $at = 0.0
@@ -100,7 +172,7 @@ if ($Script) {
         $verb = $parts[1]
         if ($verb -eq 'gshot') { $verb = 'shot' }
         $arg = if ($parts.Count -ge 3) { $parts[2] } else { '' }
-        $events += [pscustomobject]@{ At = $at; Verb = $verb; Arg = $arg; Done = $false }
+        $events += [pscustomobject]@{ At = $at; Verb = $verb; Arg = $arg; Capture = $capture; Done = $false }
         if ($at -gt $lastEvent) { $lastEvent = $at }
     }
     $events = @($events | Sort-Object At)
@@ -151,14 +223,53 @@ if ($srcBad.Count -gt 0) { Fail "pristine copy $pristineStamp does not match its
 # ---- collision checks ----------------------------------------------------------------------
 function Test-PidAlive([int]$p) { return [bool](Get-Process -Id $p -ErrorAction SilentlyContinue) }
 
-function Get-Collisions {
+# A lock file is live while its owner PID runs. A file that is empty or half written is treated as
+# live for 10 s (its owner is still writing it), then as stale.
+function Read-LockFile([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { return [pscustomobject]@{ pid = 0; tag = '?'; start = '?'; child = 0; mode = '?' } }
+}
+# Returns the lock object when $path holds a live lock, else $null (a stale file is removed unless -Check).
+function Get-LiveLock([string]$path, [switch]$Check) {
+    $l = Read-LockFile $path
+    if (-not $l) { return $null }
+    $lp = 0
+    [void][int]::TryParse([string]$l.pid, [ref]$lp)
+    if ($lp -gt 0 -and (Test-PidAlive $lp)) { return $l }
+    if ($lp -le 0) {
+        $age = try { ((Get-Date) - (Get-Item -LiteralPath $path -ErrorAction Stop).LastWriteTime).TotalSeconds } catch { 999 }
+        if ($age -lt 10) { return $l }
+    }
+    if (-not $Check) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    return $null
+}
+# Live slot locks of parallel sweep runs: objects with .pid, .tag, .start, .child and .slot.
+function Get-SlotLocks([switch]$Check) {
+    $live = @()
+    for ($i = 0; $i -lt $slotCount; $i++) {
+        $l = Get-LiveLock $slotPaths[$i] -Check:$Check
+        if ($l) { $l | Add-Member -NotePropertyName slot -NotePropertyValue ($i + 1) -Force; $live += $l }
+    }
+    return $live
+}
+
+function Get-Collisions([int[]]$AllowedOwners = @(), [int[]]$AllowedChildren = @()) {
     $found = @()
+    $parentOf = @{}
+    try { foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='wii-recomp.exe'" -ErrorAction Stop)) { $parentOf[[int]$c.ProcessId] = [int]$c.ParentProcessId } } catch { }
     foreach ($n in @('wii-recomp', 'ninja', 'clang', 'SeaOfStar-ToD', 'SolarFlare-ToD', 'rftod-launcher')) {
-        foreach ($pr in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) { $found += "$($pr.ProcessName).exe pid $($pr.Id)" }
+        foreach ($pr in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+            if ($n -eq 'wii-recomp') {
+                if ($AllowedChildren -contains $pr.Id) { continue }
+                if ($parentOf.ContainsKey($pr.Id) -and ($AllowedOwners -contains $parentOf[$pr.Id])) { continue }
+            }
+            $found += "$($pr.ProcessName).exe pid $($pr.Id)"
+        }
     }
     try {
         foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction Stop)) {
             if ($c.ProcessId -ne $PID -and $c.CommandLine -match 'wii-recomp-build\.ps1|wii-recomp-boot\.ps1|playtest\.ps1') {
+                if ($AllowedOwners -contains [int]$c.ProcessId) { continue }
                 $found += "script pid $($c.ProcessId): $($c.CommandLine)"
             }
         }
@@ -166,24 +277,39 @@ function Get-Collisions {
     return $found
 }
 
-function Read-Lock {
-    if (-not (Test-Path -LiteralPath $lockPath)) { return $null }
-    try { return (Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json) } catch { return [pscustomobject]@{ pid = 0; tag = '?'; start = '?' } }
-}
-# Returns a refusal text, or $null when the lock is free or stale (stale lock removed unless -Check).
+# Returns a refusal text, or $null when the exclusive lock is free or stale.
 function Get-LockRefusal([switch]$Check) {
-    $l = Read-Lock
-    if (-not $l) { return $null }
-    $lp = 0
-    [void][int]::TryParse([string]$l.pid, [ref]$lp)
-    if ($lp -gt 0 -and (Test-PidAlive $lp)) { return "another playtest holds $lockPath (pid $lp, tag $($l.tag), started $($l.start))" }
-    if (-not $Check) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue }
+    $l = Get-LiveLock $mainLockPath -Check:$Check
+    if ($l) { return "another playtest holds $mainLockPath (pid $($l.pid), tag $($l.tag), started $($l.start))" }
+    return $null
+}
+function Get-SlotRefusal([switch]$Check) {
+    $s = @(Get-SlotLocks -Check:$Check)
+    if ($s.Count -gt 0) {
+        return "parallel sweep runs hold slot locks: " + ((@($s) | ForEach-Object { "slot $($_.slot) pid $($_.pid) tag $($_.tag)" }) -join '; ')
+    }
     return $null
 }
 
 $refusal = Get-LockRefusal -Check:$DryRun
 if ($refusal) { Fail $refusal }
-$coll = @(Get-Collisions)
+$slotNo = 0
+$allowedOwners = @()
+$allowedChildren = @()
+if ($Parallel) {
+    $liveSlots = @(Get-SlotLocks -Check:$DryRun)
+    $busy = @($liveSlots | ForEach-Object { [int]$_.slot })
+    $free = @(1..$slotCount | Where-Object { $busy -notcontains $_ })
+    if ($free.Count -eq 0) { Fail "all $slotCount parallel slots are busy: $((@($liveSlots) | ForEach-Object { "slot $($_.slot) pid $($_.pid) tag $($_.tag)" }) -join '; ')" }
+    $slotNo = $free[0]
+    $lockPath = $slotPaths[$slotNo - 1]
+    $allowedOwners = @($liveSlots | ForEach-Object { [int]$_.pid })
+    $allowedChildren = @($liveSlots | ForEach-Object { [int]$_.child } | Where-Object { $_ -gt 0 })
+} else {
+    $slotRefusal = Get-SlotRefusal -Check:$DryRun
+    if ($slotRefusal) { Fail $slotRefusal }
+}
+$coll = @(Get-Collisions -AllowedOwners $allowedOwners -AllowedChildren $allowedChildren)
 if ($coll.Count -gt 0) { Fail ("something else is running: " + ($coll -join '; ')) }
 
 # ---- plan ----------------------------------------------------------------------------------
@@ -269,9 +395,11 @@ $mode = if ($DryRun) { 'DRY RUN, nothing started' } else { 'live' }
 $tlText = if ($scriptPath) { "$scriptPath ($($events.Count) events, last at $($lastEvent)s)" } else { '(none)' }
 $shotText = if ($Every -gt 0) { "$Every s" } else { 'off' }
 $winText = if ($Window) { 'shown' } else { 'windowless' }
+$modeText = if ($Parallel) { "PARALLEL sweep, slot $slotNo of $slotCount (windowless; no frame-time measurements)" } elseif ($Sweep) { 'sweep, exclusive (own title-data copy, merge afterwards)' } else { 'exclusive' }
 $tdText = if ($Coverage) { "SHARED (coverage run writes shaders.bin/profile.txt): $sharedTitleData" } else { "private copy of $sharedTitleData" }
 Write-Host "playtest plan ($mode)"
 Write-Host "  tag            : $Tag"
+Write-Host "  mode           : $modeText"
 Write-Host "  run folder     : $runDir"
 Write-Host "  exe            : $exe"
 $sourceText = if ($Tree) { "tree $discTree" } else { "image $image" }
@@ -286,13 +414,29 @@ Write-Host "  window         : $winText"
 Write-Host "  title-data     : $tdText"
 Write-Host "  pristine saves : $pristineStamp ($($manifest.Count) files, manifest verified) -> $runSaveData"
 Write-Host "  shared2        : $shared2Text"
-Write-Host "  lock           : $lockPath (free)"
+Write-Host "  lock           : $lockPath (free)$(if ($Parallel) { '; exclusive lock ' + $mainLockPath + ' free, no foreign wii-recomp.exe' })"
 Write-Host "  PATH prepend   : C:\msys64\clang64\bin"
 Write-Host "  graphics       : from $iniNote (fullscreen ignored)"
 foreach ($gk in $graphics.Keys) { Write-Host ("    {0}={1}  [{2}]" -f $gk, $graphics[$gk].value, $graphics[$gk].source) }
 Write-Host "  env:"
 foreach ($k in $envPlan.Keys) { Write-Host ("    {0}={1}" -f $k, $envPlan[$k]) }
-if ($DryRun) { Write-Host 'dry run: all checks passed, nothing created or started.'; exit 0 }
+if ($DryRun) {
+    $tlVarEvents = @($events | Where-Object { $_.Capture -or (Get-VarNames $_.Arg).Count -gt 0 })
+    if ($tlVarEvents.Count -gt 0) {
+        Write-Host '  timeline variables (shown unsubstituted; values come from replies at run time):'
+        $known = @{}
+        foreach ($e in $events) {
+            $uses = @(Get-VarNames $e.Arg)
+            $unk = @($uses | Where-Object { -not $known.ContainsKey($_) -and -not ($_ -match '^(.+)_\d+$' -and $known.ContainsKey($Matches[1])) })
+            if ($e.Capture -or $uses.Count -gt 0) {
+                $line = ('    {0,7:N2}s {1} {2}{3}' -f $e.At, $e.Verb, $e.Arg, $(if ($e.Capture) { " -> $($e.Capture)" } else { '' }))
+                Write-Host $line
+                if ($unk.Count -gt 0) { Write-Host ("      [warn] uses variable before any earlier capture: {0} (that line would be skipped)" -f ($unk -join ', ')) }
+            }
+            if ($e.Capture) { $known[$e.Capture] = $true }
+        }
+    }
+    Write-Host 'dry run: all checks passed, nothing created or started.'; exit 0 }
 
 # ---- live run ------------------------------------------------------------------------------
 $lockHeld = $false
@@ -307,9 +451,50 @@ $hashesAfter = $null
 $dataNames = @($manifest.Keys)
 $summaryPath = Join-Path $runDir 'summary.json'
 
+$pipeLogPath = Join-Path $runDir 'pipe.log'
+$script:replyBuffer = New-Object System.Text.StringBuilder
+$script:pendingRead = $null
+$script:readBytes = New-Object byte[] 4096
+$script:repliesOn = $false
+
+# One reply line from the runtime (it answers every command with exactly one line once
+# "reply on" was sent), or $null after $timeoutMs. A read that timed out stays pending and
+# is picked up by the next call, so no bytes are lost.
+function Read-Reply([int]$timeoutMs = 2000) {
+    $clockR = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $text = $script:replyBuffer.ToString()
+        $nl = $text.IndexOf("`n")
+        if ($nl -ge 0) {
+            [void]$script:replyBuffer.Remove(0, $nl + 1)
+            return $text.Substring(0, $nl).TrimEnd("`r")
+        }
+        if (-not $script:pendingRead) { $script:pendingRead = $pipe.ReadAsync($script:readBytes, 0, $script:readBytes.Length) }
+        $left = $timeoutMs - [int]$clockR.ElapsedMilliseconds
+        if ($left -le 0 -or -not $script:pendingRead.Wait($left)) { return $null }
+        $n = 0
+        try { $n = $script:pendingRead.Result } catch { $n = 0 }
+        $script:pendingRead = $null
+        if ($n -le 0) { return $null }  # The runtime closed the pipe.
+        [void]$script:replyBuffer.Append([Text.Encoding]::UTF8.GetString($script:readBytes, 0, $n))
+    }
+}
+
+# Sends one command and records its reply: on screen under the "  > verb" line, and in pipe.log.
+function Send-Command([string]$cmd, [double]$at = 0, [int]$timeoutMs = 2000, [switch]$Quiet) {
+    $writer.WriteLine($cmd)
+    $reply = $null
+    if ($script:repliesOn) { $reply = Read-Reply $timeoutMs }
+    $shown = if ($script:repliesOn) { if ($null -eq $reply) { '<no reply>' } else { $reply } } else { '<replies off>' }
+    try { Add-Content -LiteralPath $pipeLogPath -Value ("{0}`t{1}`t{2}" -f (Get-Date).ToString('HH:mm:ss.fff'), $cmd, $shown) -Encoding UTF8 } catch { }
+    if (-not $Quiet) { Write-Host ("  < {0}" -f $shown) }
+    return $reply
+}
+
 function Grab([string]$path) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-    $writer.WriteLine("shot $path")
+    $r = Send-Command "shot $path" 0 2000 -Quiet
+    $script:lastGrabReply = if ($script:repliesOn) { if ($null -eq $r) { '<no reply>' } else { $r } } else { $null }
     for ($i = 0; $i -lt 80; $i++) {
         if (Test-Path -LiteralPath $path) {
             try { $s = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite'); $s.Close(); return $true } catch { }
@@ -321,18 +506,38 @@ function Grab([string]$path) {
 
 try {
     # Atomic lock: CreateNew fails if the file exists.
-    $lockBody = (@{ pid = $PID; tag = $Tag; start = $startedAt.ToString('o') } | ConvertTo-Json -Compress)
+    $lockMode = if ($Parallel) { 'parallel' } else { 'exclusive' }
+    $lockBody = (@{ pid = $PID; tag = $Tag; start = $startedAt.ToString('o'); mode = $lockMode; child = 0 } | ConvertTo-Json -Compress)
     $fs = $null
-    try {
-        $fs = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
-    } catch [System.IO.IOException] {
-        throw "could not take $lockPath (another playtest started first)"
+    $candidates = if ($Parallel) { @(1..$slotCount) } else { @(0) }
+    foreach ($cn in $candidates) {
+        $cpath = if ($Parallel) { $slotPaths[$cn - 1] } else { $mainLockPath }
+        if ($Parallel) { [void](Get-LiveLock $cpath) }  # clears a stale slot lock
+        try {
+            $fs = [System.IO.File]::Open($cpath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        } catch [System.IO.IOException] { $fs = $null; continue }
+        $lockPath = $cpath
+        $slotNo = $cn
+        $lockHeld = $true
+        break
     }
-    $lockHeld = $true
+    if (-not $lockHeld) {
+        throw $(if ($Parallel) { "could not take a slot lock (all $slotCount slots busy)" } else { "could not take $mainLockPath (another playtest started first)" })
+    }
     try {
         $bytes = [Text.Encoding]::UTF8.GetBytes($lockBody)
         $fs.Write($bytes, 0, $bytes.Length)
     } finally { $fs.Dispose() }
+    # Re-check the other lock kind now that ours exists (closes the start-up race between modes).
+    if ($Parallel) {
+        $re = Get-LockRefusal -Check
+        if ($re) { throw $re }
+        Write-Host "took slot $slotNo ($lockPath)"
+    } else {
+        $re = Get-SlotRefusal -Check
+        if ($re) { throw $re }
+    }
+    if (Test-Path -LiteralPath $runDir) { throw "run folder $runDir already exists (use a different -Tag)" }
 
     New-Item -ItemType Directory -Force -Path $runDir, $shotsDir, $runSaveData | Out-Null
     foreach ($n in $manifest.Keys) { Copy-Item -LiteralPath (Join-Path $pristineDir $n) -Destination (Join-Path $runSaveData $n) -Force }
@@ -355,12 +560,18 @@ try {
     $env:PATH = 'C:\msys64\clang64\bin;' + $env:PATH
 
     $proc = Start-Process -FilePath $exe -ArgumentList ('"' + $launchTarget + '"') -WorkingDirectory (Split-Path $exe -Parent) -PassThru -RedirectStandardError $errLog -RedirectStandardOutput $outLog
+    if ($Parallel) {
+        # Record the child PID so other parallel runs and the collision check know this wii-recomp.exe is ours.
+        $tmpLock = "$lockPath.tmp"
+        (@{ pid = $PID; tag = $Tag; start = $startedAt.ToString('o'); mode = 'parallel'; child = $proc.Id } | ConvertTo-Json -Compress) | Set-Content -LiteralPath $tmpLock -Encoding UTF8
+        Move-Item -LiteralPath $tmpLock -Destination $lockPath -Force
+    }
     Write-Host "started pid $($proc.Id), pipe $(if ($NoControl) { '(none)' } else { $pipeName })"
 
     $deadline = (Get-Date).AddSeconds(25)
     while (-not $NoControl -and -not $pipe -and (Get-Date) -lt $deadline -and -not $proc.HasExited) {
         try {
-            $cand = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::Out)
+            $cand = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
             $cand.Connect(500)
             $pipe = $cand
         } catch { Start-Sleep -Milliseconds 100 }
@@ -368,6 +579,11 @@ try {
     if ($pipe) {
         $writer = New-Object System.IO.StreamWriter($pipe)
         $writer.AutoFlush = $true
+        # Ask the runtime to answer every command (older builds ignore it and stay silent).
+        $writer.WriteLine('reply on')
+        $first = Read-Reply 3000
+        $script:repliesOn = ($first -like 'ok*')
+        Write-Host ("control replies: {0}" -f $(if ($script:repliesOn) { 'on' } else { "off (runtime did not answer 'reply on': $first)" }))
     } elseif (-not $NoControl) {
         Write-Host '[warn] no control pipe; running blind (no input, no shots)'
     }
@@ -382,17 +598,30 @@ try {
         if ($writer) {
             foreach ($e in @($events | Where-Object { -not $_.Done -and $t -ge $_.At })) {
                 $e.Done = $true
+                $ex = Expand-Vars $e.Arg
+                if ($ex.Missing.Count -gt 0) {
+                    $msg = "unknown variable(s) $($ex.Missing -join ', '); line skipped"
+                    Write-Host ("  ! {0} {1} at {2:N2}s: {3}" -f $e.Verb, $e.Arg, $t, $msg)
+                    try { Add-Content -LiteralPath $pipeLogPath -Value ("{0}`t{1}`t<skipped: {2}>" -f (Get-Date).ToString('HH:mm:ss.fff'), ($e.Verb + ' ' + $e.Arg), $msg) -Encoding UTF8 } catch { }
+                    continue
+                }
                 if ($e.Verb -eq 'shot') {
-                    $p = $e.Arg
+                    $p = $ex.Text
                     if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $shotsDir $p }
                     $ok = Grab $p
                     if ($ok) { $shotCount++ }
                     Write-Host ("  > shot {0} at {1:N2}s ok={2}" -f $p, $t, $ok)
+                    if ($script:lastGrabReply) { Write-Host ("  < {0}" -f $script:lastGrabReply) }
                 } else {
                     $cmd = $e.Verb
-                    if ($e.Arg) { $cmd += ' ' + $e.Arg }
-                    $writer.WriteLine($cmd)
+                    if ($ex.Text) { $cmd += ' ' + $ex.Text }
                     Write-Host ("  > {0} at {1:N2}s" -f $cmd, $t)
+                    $rep = Send-Command $cmd $t
+                    if ($e.Capture) {
+                        $got = @(Set-Captures $e.Capture $e.Verb $rep)
+                        if ($got.Count -gt 0) { Write-Host ("  = {0}" -f ($got -join ' ')) }
+                        else { Write-Host ("  ! no value captured for {0} (reply: {1})" -f $e.Capture, $rep) }
+                    }
                 }
             }
             if ($t -ge $nextShot) {
@@ -441,6 +670,10 @@ finally {
                 exit_reason = $exitReason
                 pristine_stamp = $pristineStamp
                 coverage_run = [bool]$Coverage
+                sweep = [bool]$Sweep
+                parallel = [bool]$Parallel
+                slot = $slotNo
+                title_data = $runTitleData
                 seed_shared = $seedShared2
                 source = $sourceText
                 save_hashes_before = $hashesBefore

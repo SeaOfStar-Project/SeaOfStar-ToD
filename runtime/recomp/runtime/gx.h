@@ -24,6 +24,11 @@ extern GxState gx;
 // prepared_shaders are the recipe set built before the first picture.
 typedef struct { unsigned draws, copies, to_screen, draw_done, new_shaders, prepared_shaders, new_pipelines, passes, drains, waited_reads; float slowest_shader_ms, worst_frame_ms; } GxStats;
 extern GxStats gx_stats;
+// Measuring what a miss costs while playing (WII_RECOMP_ACTIVITY): the time and count of programs built
+// since the last pipeline miss was reported, the pipelines built in all, and the programs built in all.
+extern double gx_miss_program_ms;
+extern unsigned gx_miss_programs, gx_pipeline_total;
+unsigned gx_shader_program_count(void);
 
 enum { VERTEX_MATRIX_POSITION = 0, VERTEX_MATRIX_COORDINATE = 1, VERTEX_MATRICES = 1 + MAX_TEXTURE_MAPS, VERTEX_MATRIX_SLOTS = 12, VERTEX_NORMALS_UV = 5 };
 // A spare matrix slot that tells a corner of a line or point drawn as a quad. See gx_draw_expanded.

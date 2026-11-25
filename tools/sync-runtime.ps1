@@ -40,11 +40,17 @@ Write-Item 'source' "$Source ($Branch)" 'info'
 $wanted = @(& git -C $Source ls-tree -r --name-only $Branch)
 if ($LASTEXITCODE -ne 0 -or $wanted.Count -eq 0) { throw "Branch '$Branch' not found or empty in $Source" }
 
+# Use Windows bsdtar explicitly: GNU tar from Git-bash earlier on PATH reads "C:" as a remote host.
+$bsdtar = Join-Path $env:SystemRoot 'System32\tar.exe'
+if (-not (Test-Path -LiteralPath $bsdtar)) {
+    throw "Windows tar not found at $bsdtar; it ships with Windows 10 1803 and later."
+}
+
 $tar = Join-Path ([IO.Path]::GetTempPath()) ("runtime-sync-" + [guid]::NewGuid().ToString('N') + '.tar')
 try {
     Invoke-Checked 'git' @('-C', $Source, 'archive', '--format=tar', "--output=$tar", $Branch)
     New-Item -ItemType Directory -Force -Path $runtime | Out-Null
-    Invoke-Checked 'tar' @('-xf', $tar, '-C', $runtime)
+    Invoke-Checked $bsdtar @('-xf', $tar, '-C', $runtime)
 } finally {
     Remove-Item -LiteralPath $tar -Force -ErrorAction SilentlyContinue
 }

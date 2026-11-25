@@ -15,6 +15,7 @@ Index of the SeaOfStar-ToD docs. Start with the progress snapshot for the curren
 | [08-progress.md](08-progress.md) | Dated snapshot of what works, what is proven and what is open |
 | [controls.md](controls.md) | Keyboard, mouse and gamepad controls and remapping |
 | [gx-vulkan-notes.md](gx-vulkan-notes.md) | Design notes for the GX to Vulkan renderer |
+| [shader-collection-research.md](shader-collection-research.md) | How shader recipes get collected: sweeps, merging, measured coverage |
 
 Also at the repository root: [../README.md](../README.md) (overview),
 [../CONTRIBUTING.md](../CONTRIBUTING.md) and [../CREDITS.md](../CREDITS.md).
