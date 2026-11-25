@@ -1,0 +1,1195 @@
+#!/usr/bin/env python3
+"""Translate each function of a Wii program into C.
+
+Usage: recomp/translate/emit.py extracted/sys/main.dol recomp/build/generated [--all-code] [--fifo-breakpoints] [--virtual-bluetooth] [--scale N[/D]]
+                                [--profile FILE] [--discovered FILE]...
+
+--all-code also translates code that nothing visibly points at, which games with C++
+method tables built at run time need. --fifo-breakpoints makes the graphics chip honour
+FIFO breakpoints, for games that keep several frames in the FIFO. Wii Fit sets one but
+needs it ignored, as it sends two tokens a frame. --virtual-bluetooth runs the game's own
+Wii Remote code against the virtual Bluetooth chip in place of direct input.
+
+--profile builds in two tiers, from a profile.txt the console wrote while the title ran.
+The functions that did most of the work go in part*.c, compiled for speed; the rest go in
+cold*.c, compiled quickly, and count their runs so the next profile can promote them. A
+missing file means nothing has run yet: everything is quick and counts. Without --profile,
+everything is compiled for speed and nothing counts. --discovered adds each address in a
+discovered.txt, where the console's interpreter ran code the translator missed, as a
+function start.
+"""
+import multiprocessing
+import os
+import re
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+from decode import Program, name_of
+import modules
+from functions import add_starts, add_unreached_code, branch_target, find_functions, read_starts, signed
+from signatures import load_entries, resolve
+
+FUNCTIONS_PER_FILE = 150
+GROUP_FILE = re.compile(r"(part|cold)\d{4}\.c")
+# Filled in for each game from signatures.py. REPLACED holds the system functions we
+# replace rather than translate, as address -> (reason, C body). IDLE_LOOPS holds loops
+# where the game waits for an interrupt with nothing to do. Spinning them at full speed
+# keeps a core busy for no work, so they sleep instead.
+REPLACED = {}
+IDLE_LOOPS = {}
+# Replacements that skip the game's Wii Remote code, for games not on virtual Bluetooth.
+DIRECT_INPUT = {"input_read();", "input_probe();"}
+IOS_OFFSET = 0x184  # The IOS the title asks for, in its TMD.
+TITLE_ID_OFFSET = 0x18c  # In the disc's tmd.bin.
+DECREMENTER = 22
+CACHE_DMA_LOW = 923
+WRITE_PIPE_ADDRESS = 921  # WPAR: where the CPU's write-gather pipe sends its bursts.
+LINK = 8
+COUNT = 9
+XER = 1
+TIME_LOW = 268
+TIME_HIGH = 269
+TIME_LOW_WRITE = 284
+TIME_HIGH_WRITE = 285
+OVERFLOW_ENABLE = 0x400
+
+
+def s16(word):
+    return signed(word & 0xffff, 16)
+
+
+def s12(word):
+    return signed(word & 0xfff, 12)
+
+
+def rt(word):
+    return (word >> 21) & 31
+
+
+def ra(word):
+    return (word >> 16) & 31
+
+
+def rb(word):
+    return (word >> 11) & 31
+
+
+def rc(word):
+    return (word >> 6) & 31
+
+
+def base(word):
+    return f"(cpu.r[{ra(word)}] + {s16(word)})" if ra(word) else f"(uint32_t)({s16(word)})"
+
+
+def base_u(word):
+    return f"(cpu.r[{ra(word)}] + {s16(word)})"
+
+
+def indexed(word):
+    return f"(cpu.r[{ra(word)}] + cpu.r[{rb(word)}])" if ra(word) else f"cpu.r[{rb(word)}]"
+
+
+def record(word, value):
+    return f"cpu.cr[0] = cr_compare((int32_t){value}, 0);" if word & 1 else ""
+
+
+def record_float(word):
+    return " cpu.cr[1] = (uint8_t)(cpu.fpscr >> 28);" if word & 1 else ""
+
+
+def spr_number(word):
+    return ((word >> 16) & 31) | (((word >> 11) & 31) << 5)
+
+
+def condition(word):
+    """A C test for a conditional branch's BO and BI fields."""
+    bo, bi = rt(word), ra(word)
+    parts, before = [], ""
+    if not bo & 4:
+        before = "cpu.ctr--;"
+        parts.append("cpu.ctr == 0" if bo & 2 else "cpu.ctr != 0")
+    if not bo & 16:
+        parts.append(f"cr_bit({bi})" if bo & 8 else f"!cr_bit({bi})")
+    return before, " && ".join(parts) or "1"
+
+
+LOADS = {"lwz": "rd32({a})", "lbz": "rd8({a})", "lhz": "rd16({a})", "lha": "(uint32_t)(int16_t)rd16({a})"}
+STORES = {"stw": "wr32({a}, {v})", "stb": "wr8({a}, {v})", "sth": "wr16({a}, {v})"}
+INDEXED_LOADS = {"lwzx": "lwz", "lbzx": "lbz", "lhzx": "lhz", "lhax": "lha"}
+INDEXED_UPDATE_LOADS = {"lwzux": "lwz", "lbzux": "lbz", "lhzux": "lhz", "lhaux": "lha"}
+INDEXED_STORES = {"stwx": "stw", "stbx": "stb", "sthx": "sth"}
+INDEXED_UPDATE_STORES = {"stwux": "stw", "stbux": "stb", "sthux": "sth"}
+NO_OPERATIONS = {"sync", "isync", "eieio", "dcba", "dcbf", "dcbi", "dcbst", "dcbt", "dcbtst", "icbi", "tlbie", "tlbsync"}
+ROUND_SINGLE = "(double)(float)"
+
+
+def fload(address, double):
+    return f"as_double(rd64({address}))" if double else f"single_to_double(rd32({address}))"
+
+
+def load_float(word, address, double):
+    d = rt(word)
+    value = fload(address, double)
+    if double:
+        return f"cpu.f[{d}] = {value};"
+    return f"cpu.f[{d}] = cpu.p[{d}] = {value};"
+
+
+def store_float(word, address, double):
+    d = rt(word)
+    if double:
+        return f"wr64({address}, double_bits(cpu.f[{d}]));"
+    return f"wr32({address}, double_to_single(cpu.f[{d}]));"
+
+
+def math(word, name):
+    """Floating-point arithmetic, for scalar and paired forms."""
+    d, a, b, c = rt(word), ra(word), rb(word), rc(word)
+    single = name.endswith("s") and name != "fres"
+    kind = name[:-1] if single else name
+    wrap = (lambda e: f"{ROUND_SINGLE}({e})") if single else (lambda e: e)
+    expressions = {
+        "fadd": f"cpu.f[{a}] + cpu.f[{b}]", "fsub": f"cpu.f[{a}] - cpu.f[{b}]",
+        "fmul": f"cpu.f[{a}] * cpu.f[{c}]", "fdiv": f"cpu.f[{a}] / cpu.f[{b}]",
+        "fmadd": f"cpu.f[{a}] * cpu.f[{c}] + cpu.f[{b}]", "fmsub": f"cpu.f[{a}] * cpu.f[{c}] - cpu.f[{b}]",
+        "fnmadd": f"-(cpu.f[{a}] * cpu.f[{c}] + cpu.f[{b}])", "fnmsub": f"-(cpu.f[{a}] * cpu.f[{c}] - cpu.f[{b}])",
+    }
+    text = f"cpu.f[{d}] = {wrap(expressions[kind])};"
+    if single:
+        text += f" cpu.p[{d}] = cpu.f[{d}];"
+    return text + record_float(word)
+
+
+PAIRED_MATH = {
+    "ps_add": "{x}[{a}] + {x}[{b}]", "ps_sub": "{x}[{a}] - {x}[{b}]", "ps_mul": "{x}[{a}] * {x}[{c}]",
+    "ps_div": "{x}[{a}] / {x}[{b}]", "ps_madd": "{x}[{a}] * {x}[{c}] + {x}[{b}]",
+    "ps_msub": "{x}[{a}] * {x}[{c}] - {x}[{b}]", "ps_nmadd": "-({x}[{a}] * {x}[{c}] + {x}[{b}])",
+    "ps_nmsub": "-({x}[{a}] * {x}[{c}] - {x}[{b}])", "ps_res": "1.0 / {x}[{b}]",
+    "ps_rsqrte": "1.0 / sqrt({x}[{b}])",
+}
+
+
+def paired(word, name):
+    d, a, b, c = rt(word), ra(word), rb(word), rc(word)
+    if name in PAIRED_MATH:
+        first = PAIRED_MATH[name].format(x="f0", a=a, b=b, c=c)
+        second = PAIRED_MATH[name].format(x="f1", a=a, b=b, c=c)
+        return (f"{{ double *f0 = cpu.f, *f1 = cpu.p; double x = (float)({first}), y = (float)({second});"
+                f" cpu.f[{d}] = x; cpu.p[{d}] = y; }}")
+    table = {
+        "ps_mr": f"cpu.f[{d}] = cpu.f[{b}]; cpu.p[{d}] = cpu.p[{b}];",
+        "ps_neg": f"cpu.f[{d}] = -cpu.f[{b}]; cpu.p[{d}] = -cpu.p[{b}];",
+        "ps_abs": f"cpu.f[{d}] = fabs(cpu.f[{b}]); cpu.p[{d}] = fabs(cpu.p[{b}]);",
+        "ps_nabs": f"cpu.f[{d}] = -fabs(cpu.f[{b}]); cpu.p[{d}] = -fabs(cpu.p[{b}]);",
+        "ps_merge00": f"{{ double x = cpu.f[{a}], y = cpu.f[{b}]; cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_merge01": f"{{ double x = cpu.f[{a}], y = cpu.p[{b}]; cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_merge10": f"{{ double x = cpu.p[{a}], y = cpu.f[{b}]; cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_merge11": f"{{ double x = cpu.p[{a}], y = cpu.p[{b}]; cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_sum0": f"{{ double x = (float)(cpu.f[{a}] + cpu.p[{b}]), y = (float)cpu.p[{c}]; cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_sum1": f"{{ double x = (float)cpu.f[{c}], y = (float)(cpu.f[{a}] + cpu.p[{b}]); cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_muls0": f"{{ double x = (float)(cpu.f[{a}] * cpu.f[{c}]), y = (float)(cpu.p[{a}] * cpu.f[{c}]); cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_muls1": f"{{ double x = (float)(cpu.f[{a}] * cpu.p[{c}]), y = (float)(cpu.p[{a}] * cpu.p[{c}]); cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_madds0": f"{{ double x = (float)(cpu.f[{a}] * cpu.f[{c}] + cpu.f[{b}]), y = (float)(cpu.p[{a}] * cpu.f[{c}] + cpu.p[{b}]); cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_madds1": f"{{ double x = (float)(cpu.f[{a}] * cpu.p[{c}] + cpu.f[{b}]), y = (float)(cpu.p[{a}] * cpu.p[{c}] + cpu.p[{b}]); cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+        "ps_sel": f"{{ double x = cpu.f[{a}] >= 0 ? cpu.f[{c}] : cpu.f[{b}], y = cpu.p[{a}] >= 0 ? cpu.p[{c}] : cpu.p[{b}]; cpu.f[{d}] = x; cpu.p[{d}] = y; }}",
+    }
+    if name in table:
+        return table[name]
+    field = rt(word) >> 2
+    compare = {"ps_cmpu0": ("f", "f"), "ps_cmpo0": ("f", "f"), "ps_cmpu1": ("p", "p"), "ps_cmpo1": ("p", "p")}
+    if name in compare:
+        return f"cpu.cr[{field}] = cr_float(cpu.{compare[name][0]}[{a}], cpu.{compare[name][1]}[{b}]);"
+    return None
+
+
+def quantized(word, name, address):
+    """psq forms carry W at bit 16 (or 21 when indexed) and I in the next bits."""
+    if name in ("psq_l", "psq_lu", "psq_st", "psq_stu"):
+        w, gqr = (word >> 15) & 1, (word >> 12) & 7
+    else:
+        w, gqr = (word >> 10) & 1, (word >> 7) & 7
+    call = "ps_load_inline" if "_l" in name else "ps_store_inline"
+    return f"{call}({address}, {w}, {gqr}, {rt(word)});"
+
+
+def string_load(first, count, e):
+    return (f"{{ uint32_t e = {e}; for (uint32_t i = 0; i < {count}; i++) {{ uint32_t r = ({first} + (i >> 2)) & 31;"
+            f" if (!(i & 3)) cpu.r[r] = 0; cpu.r[r] |= rd8(e + i) << (24 - (i & 3) * 8); }} }}")
+
+
+def string_store(first, count, e):
+    return (f"{{ uint32_t e = {e}; for (uint32_t i = 0; i < {count}; i++)"
+            f" wr8(e + i, cpu.r[({first} + (i >> 2)) & 31] >> (24 - (i & 3) * 8)); }}")
+
+
+def overflowing(name, a, b):
+    """The arithmetic forms with OE set, which also write OV and SO."""
+    x, y = f"cpu.r[{a}]", f"cpu.r[{b}]"
+    return {
+        "add": f"add_overflow({x}, {y}, 0)", "subf": f"add_overflow(~{x}, {y}, 1)", "neg": f"add_overflow(~{x}, 0, 1)",
+        "mullw": f"multiply_overflow({x}, {y})",
+        "divw": f"divide_signed_overflow({x}, {y})", "divwu": f"divide_unsigned_overflow({x}, {y})",
+        "addc": f"add_carry_overflow({x}, {y}, 0)", "adde": f"add_carry_overflow({x}, {y}, cpu.ca)",
+        "subfc": f"add_carry_overflow(~{x}, {y}, 1)", "subfe": f"add_carry_overflow(~{x}, {y}, cpu.ca)",
+        "addze": f"add_carry_overflow({x}, 0, cpu.ca)", "addme": f"add_carry_overflow({x}, 0xffffffffu, cpu.ca)",
+        "subfze": f"add_carry_overflow(~{x}, 0, cpu.ca)", "subfme": f"add_carry_overflow(~{x}, 0xffffffffu, cpu.ca)",
+    }.get(name)
+
+
+def trap(address, word, name):
+    """tw and twi. A trap that fires would enter the game's program exception handler,
+    which in a retail game only reports an assert and halts. That isn't delivered: the
+    runtime reports it and carries on, as before."""
+    to, a = rt(word), ra(word)
+    other = f"0x{s16(word) & 0xffffffff:x}u" if name == "twi" else f"cpu.r[{rb(word)}]"
+    tests = {16: f"(int32_t)cpu.r[{a}] < (int32_t){other}", 8: f"(int32_t)cpu.r[{a}] > (int32_t){other}",
+             4: f"cpu.r[{a}] == {other}", 2: f"cpu.r[{a}] < {other}", 1: f"cpu.r[{a}] > {other}"}
+    parts = [test for bit, test in tests.items() if to & bit]
+    if not parts:
+        return ";"
+    test = "1" if to == 31 else " || ".join(f"({part})" for part in parts)
+    return f"if ({test}) trap_taken({address_text(address)});"
+
+
+# Displacement forms through r1, the stack pointer. The stack is always memory, so these
+# use the accessors that skip the hardware check (cpu.h). That's about half of all
+# stores: every prologue, epilogue and spill.
+STACK_FORMS = {"lwz", "lbz", "lhz", "lha", "lwzu", "lbzu", "lhzu", "lhau", "stw", "stb", "sth", "stwu", "stbu", "sthu",
+               "lmw", "stmw", "lfs", "lfd", "lfsu", "lfdu", "stfs", "stfd", "stfsu", "stfdu"}
+ACCESS = re.compile(r"\b((?:rd|wr)(?:8|16|32|64))\(")
+
+
+def emit(address, word, name):
+    text = emit_any(address, word, name)
+    if ra(word) == 1 and name in STACK_FORMS:
+        text = ACCESS.sub(r"\1s(", text)
+    return text
+
+
+def emit_any(address, word, name):
+    """Returns C for one instruction that isn't a branch, or None if not handled."""
+    d, a, b = rt(word), ra(word), rb(word)
+    imm, uimm = s16(word), word & 0xffff
+    if name == "addi":
+        return f"cpu.r[{d}] = {f'cpu.r[{a}] + ' if a else ''}(uint32_t)({imm});"
+    if name == "addis":
+        return f"cpu.r[{d}] = {f'cpu.r[{a}] + ' if a else ''}0x{uimm << 16:x}u;"
+    if name == "addic":
+        return f"cpu.r[{d}] = add_carry(cpu.r[{a}], (uint32_t)({imm}), 0);"
+    if name == "addic.":
+        return f"cpu.r[{d}] = add_carry(cpu.r[{a}], (uint32_t)({imm}), 0); cpu.cr[0] = cr_compare((int32_t)cpu.r[{d}], 0);"
+    if name == "subfic":
+        return f"cpu.r[{d}] = add_carry(~cpu.r[{a}], (uint32_t)({imm}), 1);"
+    if name == "mulli":
+        return f"cpu.r[{d}] = cpu.r[{a}] * (uint32_t)({imm});"
+    if name == "cmpi":
+        return f"cpu.cr[{d >> 2}] = cr_compare((int32_t)cpu.r[{a}], {imm});"
+    if name == "cmpli":
+        return f"cpu.cr[{d >> 2}] = cr_compare_unsigned(cpu.r[{a}], {uimm}u);"
+    if name == "cmp":
+        return f"cpu.cr[{d >> 2}] = cr_compare((int32_t)cpu.r[{a}], (int32_t)cpu.r[{b}]);"
+    if name == "cmpl":
+        return f"cpu.cr[{d >> 2}] = cr_compare_unsigned(cpu.r[{a}], cpu.r[{b}]);"
+    logic = {"ori": "|", "oris": "|", "xori": "^", "xoris": "^", "andi.": "&", "andis.": "&"}
+    if name in logic:
+        value = uimm << 16 if name.endswith(("s", "s.")) else uimm
+        text = f"cpu.r[{a}] = cpu.r[{d}] {logic[name]} 0x{value:x}u;"
+        return text + (f" cpu.cr[0] = cr_compare((int32_t)cpu.r[{a}], 0);" if name.endswith(".") else "")
+    if name == "rlwinm":
+        text = f"cpu.r[{a}] = rotl(cpu.r[{d}], {b}) & 0x{mask_value(rc(word), (word >> 1) & 31):x}u;"
+        return text + record(word, f"cpu.r[{a}]")
+    if name == "rlwnm":
+        text = f"cpu.r[{a}] = rotl(cpu.r[{d}], cpu.r[{b}]) & 0x{mask_value(rc(word), (word >> 1) & 31):x}u;"
+        return text + record(word, f"cpu.r[{a}]")
+    if name == "rlwimi":
+        m = mask_value(rc(word), (word >> 1) & 31)
+        text = f"cpu.r[{a}] = (rotl(cpu.r[{d}], {b}) & 0x{m:x}u) | (cpu.r[{a}] & 0x{~m & 0xffffffff:x}u);"
+        return text + record(word, f"cpu.r[{a}]")
+    if name in LOADS:
+        return f"cpu.r[{d}] = {LOADS[name].format(a=base(word))};"
+    if name[:-1] in LOADS and name.endswith("u"):
+        return f"{{ uint32_t e = {base_u(word)}; cpu.r[{d}] = {LOADS[name[:-1]].format(a='e')}; cpu.r[{a}] = e; }}"
+    if name in STORES:
+        return STORES[name].format(a=base(word), v=f"cpu.r[{d}]") + ";"
+    if name[:-1] in STORES and name.endswith("u"):
+        return f"{{ uint32_t e = {base_u(word)}; {STORES[name[:-1]].format(a='e', v=f'cpu.r[{d}]')}; cpu.r[{a}] = e; }}"
+    if name in INDEXED_LOADS:
+        return f"cpu.r[{d}] = {LOADS[INDEXED_LOADS[name]].format(a=indexed(word))};"
+    if name in INDEXED_UPDATE_LOADS:
+        return f"{{ uint32_t e = cpu.r[{a}] + cpu.r[{b}]; cpu.r[{d}] = {LOADS[INDEXED_UPDATE_LOADS[name]].format(a='e')}; cpu.r[{a}] = e; }}"
+    if name in INDEXED_STORES:
+        return STORES[INDEXED_STORES[name]].format(a=indexed(word), v=f"cpu.r[{d}]") + ";"
+    if name in INDEXED_UPDATE_STORES:
+        return f"{{ uint32_t e = cpu.r[{a}] + cpu.r[{b}]; {STORES[INDEXED_UPDATE_STORES[name]].format(a='e', v=f'cpu.r[{d}]')}; cpu.r[{a}] = e; }}"
+    if name == "lmw":
+        return f"{{ uint32_t e = {base(word)}; for (int i = {d}; i < 32; i++, e += 4) cpu.r[i] = rd32(e); }}"
+    if name == "stmw":
+        return f"{{ uint32_t e = {base(word)}; for (int i = {d}; i < 32; i++, e += 4) wr32(e, cpu.r[i]); }}"
+    if name == "lswi":
+        return string_load(d, b or 32, f"cpu.r[{a}]" if a else "0")
+    if name == "stswi":
+        return string_store(d, b or 32, f"cpu.r[{a}]" if a else "0")
+    if name == "lswx":
+        return string_load(d, "(cpu.xer_string & 0xff)", indexed(word))
+    if name == "stswx":
+        return string_store(d, "(cpu.xer_string & 0xff)", indexed(word))
+    if name == "eciwx":
+        return f"cpu.r[{d}] = rd32({indexed(word)});"
+    if name == "ecowx":
+        return f"wr32({indexed(word)}, cpu.r[{d}]);"
+    if name == "lwbrx":
+        return f"cpu.r[{d}] = __builtin_bswap32(rd32({indexed(word)}));"
+    if name == "lhbrx":
+        return f"cpu.r[{d}] = __builtin_bswap16((uint16_t)rd16({indexed(word)}));"
+    if name == "stwbrx":
+        return f"wr32({indexed(word)}, __builtin_bswap32(cpu.r[{d}]));"
+    if name == "sthbrx":
+        return f"wr16({indexed(word)}, __builtin_bswap16((uint16_t)cpu.r[{d}]));"
+    if name == "lwarx":
+        return f"cpu.r[{d}] = rd32({indexed(word)});"
+    if name == "stwcx.":
+        return f"wr32({indexed(word)}, cpu.r[{d}]); cpu.cr[0] = 2 | (uint8_t)cpu.so;"
+    if name in NO_OPERATIONS:
+        return ";"
+    if name in ("tw", "twi"):
+        return trap(address, word, name)
+    arithmetic = {
+        "add": f"cpu.r[{a}] + cpu.r[{b}]", "subf": f"cpu.r[{b}] - cpu.r[{a}]",
+        "mullw": f"cpu.r[{a}] * cpu.r[{b}]", "neg": f"0u - cpu.r[{a}]",
+        "mulhw": f"(uint32_t)(((int64_t)(int32_t)cpu.r[{a}] * (int32_t)cpu.r[{b}]) >> 32)",
+        "mulhwu": f"(uint32_t)(((uint64_t)cpu.r[{a}] * cpu.r[{b}]) >> 32)",
+        "divw": f"divide_signed(cpu.r[{a}], cpu.r[{b}])",
+        "divwu": f"cpu.r[{b}] ? cpu.r[{a}] / cpu.r[{b}] : 0u",
+        "addc": f"add_carry(cpu.r[{a}], cpu.r[{b}], 0)", "adde": f"add_carry(cpu.r[{a}], cpu.r[{b}], cpu.ca)",
+        "subfc": f"add_carry(~cpu.r[{a}], cpu.r[{b}], 1)", "subfe": f"add_carry(~cpu.r[{a}], cpu.r[{b}], cpu.ca)",
+        "addze": f"add_carry(cpu.r[{a}], 0, cpu.ca)", "addme": f"add_carry(cpu.r[{a}], 0xffffffffu, cpu.ca)",
+        "subfze": f"add_carry(~cpu.r[{a}], 0, cpu.ca)", "subfme": f"add_carry(~cpu.r[{a}], 0xffffffffu, cpu.ca)",
+    }
+    if name in arithmetic:
+        value = overflowing(name, a, b) if word & OVERFLOW_ENABLE else None
+        return f"cpu.r[{d}] = {value or arithmetic[name]};" + record(word, f"cpu.r[{d}]")
+    bitwise = {
+        "and": f"cpu.r[{d}] & cpu.r[{b}]", "or": f"cpu.r[{d}] | cpu.r[{b}]", "xor": f"cpu.r[{d}] ^ cpu.r[{b}]",
+        "andc": f"cpu.r[{d}] & ~cpu.r[{b}]", "orc": f"cpu.r[{d}] | ~cpu.r[{b}]",
+        "nor": f"~(cpu.r[{d}] | cpu.r[{b}])", "nand": f"~(cpu.r[{d}] & cpu.r[{b}])", "eqv": f"~(cpu.r[{d}] ^ cpu.r[{b}])",
+        "slw": f"(cpu.r[{b}] & 32) ? 0u : cpu.r[{d}] << (cpu.r[{b}] & 31)",
+        "srw": f"(cpu.r[{b}] & 32) ? 0u : cpu.r[{d}] >> (cpu.r[{b}] & 31)",
+        "extsb": f"(uint32_t)(int8_t)cpu.r[{d}]", "extsh": f"(uint32_t)(int16_t)cpu.r[{d}]",
+        "cntlzw": f"cpu.r[{d}] ? (uint32_t)__builtin_clz(cpu.r[{d}]) : 32u",
+    }
+    if name in bitwise:
+        return f"cpu.r[{a}] = {bitwise[name]};" + record(word, f"cpu.r[{a}]")
+    if name == "srawi":
+        text = (f"{{ uint32_t v = cpu.r[{d}]; cpu.ca = (v >> 31) && (v & ((1u << {b}) - 1u)) ? 1 : 0;"
+                f" cpu.r[{a}] = (uint32_t)((int32_t)v >> {b}); }}")
+        return text + record(word, f"cpu.r[{a}]")
+    if name == "sraw":
+        text = (f"{{ uint32_t v = cpu.r[{d}], n = cpu.r[{b}] & 63; uint32_t s = n > 31 ? 31 : n;"
+                f" cpu.ca = (v >> 31) && (n > 31 || (v & ((1u << s) - 1u))) ? 1 : 0;"
+                f" cpu.r[{a}] = (uint32_t)((int32_t)v >> s); }}")
+        return text + record(word, f"cpu.r[{a}]")
+    if name == "mfspr":
+        n = spr_number(word)
+        special = {DECREMENTER: "decrementer_get()", LINK: "cpu.lr", COUNT: "cpu.ctr", XER: "xer_get()",
+                   TIME_LOW: "(uint32_t)guest_time_base()", TIME_HIGH: "(uint32_t)(guest_time_base() >> 32)"}
+        if n == WRITE_PIPE_ADDRESS:  # Its low bit says the pipe holds bytes; read as empty, as Dolphin does.
+            return f"cpu.r[{d}] = cpu.spr[{n}] & ~1u;"
+        return f"cpu.r[{d}] = {special.get(n, f'cpu.spr[{n}]')};"
+    if name == "mtspr":
+        n = spr_number(word)
+        if n == DECREMENTER:
+            return f"decrementer_set(cpu.r[{d}]);"
+        if n == LINK:
+            return f"cpu.lr = cpu.r[{d}];"
+        if n == COUNT:
+            return f"cpu.ctr = cpu.r[{d}];"
+        if n == XER:
+            return f"xer_set(cpu.r[{d}]);"
+        if n == CACHE_DMA_LOW:
+            return f"cpu.spr[{n}] = cpu.r[{d}]; locked_cache_transfer();"
+        if n == WRITE_PIPE_ADDRESS:
+            return f"cpu.spr[{n}] = cpu.r[{d}]; graphics_pipe_reset();"
+        if n in (TIME_LOW_WRITE, TIME_HIGH_WRITE):
+            return f"cpu.spr[{n}] = cpu.r[{d}]; guest_time_base_set({int(n == TIME_HIGH_WRITE)}, cpu.r[{d}]);"
+        return f"cpu.spr[{n}] = cpu.r[{d}];"
+    if name == "mftb":
+        return f"cpu.r[{d}] = {'(uint32_t)(guest_time_base() >> 32)' if spr_number(word) == TIME_HIGH else '(uint32_t)guest_time_base()'};"
+    if name == "mfmsr":
+        return f"cpu.r[{d}] = cpu.msr;"
+    if name == "mtmsr":
+        return f"cpu.msr = cpu.r[{d}]; if (cpu.msr & 0x8000u) interrupts_turned_on();"
+    if name == "mfcr":
+        return f"{{ uint32_t v = 0; for (int i = 0; i < 8; i++) v = (v << 4) | cpu.cr[i]; cpu.r[{d}] = v; }}"
+    if name == "mtcrf":
+        fields = (word >> 12) & 0xff
+        return f"for (int i = 0; i < 8; i++) if ({fields} & (0x80 >> i)) cpu.cr[i] = (cpu.r[{d}] >> (28 - i * 4)) & 15;"
+    if name == "mcrf":
+        return f"cpu.cr[{d >> 2}] = cpu.cr[{a >> 2}];"
+    if name == "mcrxr":
+        return f"cpu.cr[{d >> 2}] = (uint8_t)(xer_get() >> 28); cpu.so = cpu.ov = cpu.ca = 0;"
+    condition_logic = {"crxor": "x ^ y", "cror": "x | y", "crand": "x & y", "crnor": "!(x | y)", "crnand": "!(x & y)",
+                       "creqv": "!(x ^ y)", "crandc": "x & !y", "crorc": "x | !y"}
+    if name in condition_logic:
+        return f"{{ int x = cr_bit({a}), y = cr_bit({b}); cr_set({d}, {condition_logic[name]}); }}"
+    if name == "dcbz" or name == "dcbz_l":
+        return f"{{ uint32_t e = {indexed(word)} & ~31u; for (int i = 0; i < 32; i += 4) wr32(e + i, 0); }}"
+    if name in ("lfs", "lfd"):
+        return load_float(word, base(word), name == "lfd")
+    if name in ("lfsu", "lfdu"):
+        return f"{{ uint32_t e = {base_u(word)}; {load_float(word, 'e', name == 'lfdu')} cpu.r[{a}] = e; }}"
+    if name in ("lfsx", "lfdx"):
+        return load_float(word, indexed(word), name == "lfdx")
+    if name in ("lfsux", "lfdux"):
+        return f"{{ uint32_t e = cpu.r[{a}] + cpu.r[{b}]; {load_float(word, 'e', name == 'lfdux')} cpu.r[{a}] = e; }}"
+    if name in ("stfs", "stfd"):
+        return store_float(word, base(word), name == "stfd")
+    if name in ("stfsu", "stfdu"):
+        return f"{{ uint32_t e = {base_u(word)}; {store_float(word, 'e', name == 'stfdu')} cpu.r[{a}] = e; }}"
+    if name in ("stfsx", "stfdx"):
+        return store_float(word, indexed(word), name == "stfdx")
+    if name in ("stfsux", "stfdux"):
+        return f"{{ uint32_t e = cpu.r[{a}] + cpu.r[{b}]; {store_float(word, 'e', name == 'stfdux')} cpu.r[{a}] = e; }}"
+    if name == "stfiwx":
+        return f"wr32({indexed(word)}, (uint32_t)double_bits(cpu.f[{d}]));"
+    if name in ("fadd", "fadds", "fsub", "fsubs", "fmul", "fmuls", "fdiv", "fdivs", "fmadd", "fmadds", "fmsub",
+                "fmsubs", "fnmadd", "fnmadds", "fnmsub", "fnmsubs"):
+        return math(word, name)
+    simple = {
+        "fmr": f"cpu.f[{b}]", "fneg": f"-cpu.f[{b}]", "fabs": f"fabs(cpu.f[{b}])", "fnabs": f"-fabs(cpu.f[{b}])",
+        "frsqrte": f"1.0 / sqrt(cpu.f[{b}])",
+        "fsel": f"cpu.f[{a}] >= 0 ? cpu.f[{rc(word)}] : cpu.f[{b}]",
+    }
+    if name in simple:
+        return f"cpu.f[{d}] = {simple[name]};" + record_float(word)
+    if name == "frsp":
+        return f"cpu.f[{d}] = cpu.p[{d}] = (double)(float)cpu.f[{b}];" + record_float(word)
+    if name == "fres":
+        return f"cpu.f[{d}] = cpu.p[{d}] = (double)(float)(1.0 / cpu.f[{b}]);" + record_float(word)
+    if name in ("fctiw", "fctiwz"):
+        rounding = "ROUND_TOWARD_ZERO" if name == "fctiwz" else "cpu.fpscr & FPSCR_ROUNDING"
+        return f"cpu.f[{d}] = float_to_int(cpu.f[{b}], {rounding});" + record_float(word)
+    if name in ("fcmpu", "fcmpo"):
+        return f"cpu.cr[{d >> 2}] = cr_float(cpu.f[{a}], cpu.f[{b}]);"
+    if name == "mffs":
+        return f"cpu.f[{d}] = fpscr_as_double();" + record_float(word)
+    if name == "mtfsf":
+        return f"fpscr_write_fields({(word >> 17) & 0xff}, (uint32_t)double_bits(cpu.f[{b}]));" + record_float(word)
+    if name == "mtfsfi":
+        return f"fpscr_write_field({d >> 2}, {(word >> 12) & 15});" + record_float(word)
+    if name == "mtfsb0":
+        return f"fpscr_clear_bit({d});" + record_float(word)
+    if name == "mtfsb1":
+        return f"fpscr_set_bit({d});" + record_float(word)
+    if name == "mcrfs":
+        return f"cpu.cr[{d >> 2}] = (uint8_t)fpscr_take_field({a >> 2});"
+    if name == "mfsr":
+        return f"cpu.r[{d}] = cpu.sr[{a & 15}];"
+    if name == "mtsr":
+        return f"cpu.sr[{a & 15}] = cpu.r[{d}];"
+    if name == "mfsrin":
+        return f"cpu.r[{d}] = cpu.sr[cpu.r[{b}] >> 28];"
+    if name == "mtsrin":
+        return f"cpu.sr[cpu.r[{b}] >> 28] = cpu.r[{d}];"
+    if name.startswith("psq_"):
+        update = name in ("psq_lu", "psq_stu", "psq_lux", "psq_stux")
+        if name in ("psq_l", "psq_st", "psq_lu", "psq_stu"):
+            offset = s12(word)
+            e = f"cpu.r[{a}] + {offset}" if a or update else f"(uint32_t)({offset})"
+        else:
+            e = f"cpu.r[{a}] + cpu.r[{b}]" if a or update else f"cpu.r[{b}]"
+        text = quantized(word, name, "e")
+        return f"{{ uint32_t e = {e}; {text}{f' cpu.r[{a}] = e;' if update else ''} }}"
+    if name.startswith("ps_"):
+        text = paired(word, name)
+        return text if "cmp" in name else text + record_float(word)
+    return None
+
+
+def mask_value(mb, me):
+    first = 0xffffffff >> mb
+    second = 0xffffffff if me == 31 else ~(0xffffffff >> (me + 1)) & 0xffffffff
+    return first & second if mb <= me else first | second
+
+
+def function_name(address):
+    return f"f_{address:08x}"
+
+
+# Set while a run-time-loaded module is translated: where its code and imports stand in,
+# and the C names of the addresses its linker settles on. See modules.py.
+MODULE = None
+# Program addresses of functions whose calls are to be logged, for finding who calls what
+# when: WII_RECOMP_EMIT_TRACE=80573fd0,80574268 while building.
+TRACED = {int(text, 16) for text in os.environ.get("WII_RECOMP_EMIT_TRACE", "").split(",") if text}
+FIELD_STAND_IN = 0x7b5d  # Put in place of a linker-filled immediate, then replaced by C.
+
+
+def address_text(address):
+    """An address as C. A module's own addresses depend on where it was loaded."""
+    if MODULE and MODULE["base"] <= address < MODULE["base"] + MODULE["size"]:
+        return f"({MODULE['prefix']}_code + 0x{address - MODULE['base']:x}u)"
+    if MODULE and address in MODULE.get("fixed", {}):
+        return f"0x{MODULE['fixed'][address]:x}u"
+    if MODULE and address in MODULE.get("linked", {}):
+        return f"module_branch_target({MODULE['prefix']}_code + 0x{MODULE['linked'][address]:x}u)"
+    if MODULE and MODULE["imports"] <= address < MODULE["imports"] + 4 * MODULE["import_count"]:
+        return f"{MODULE['prefix']}_import[{(address - MODULE['imports']) // 4}]"
+    return f"0x{address:x}u"
+
+
+def program_function(destination):
+    """The program function a REL module's branch goes to through its stand-in, or None."""
+    if MODULE and MODULE.get("fixed", {}).get(destination) in MODULE.get("program", ()):
+        return MODULE["fixed"][destination]
+    return None
+
+
+def emit_field(address, word, name):
+    """An instruction whose immediate the module's linker fills in, as C that works it out."""
+    kind, section, symbol, addend = MODULE["fields"][address]
+    prefix = MODULE["prefix"]
+    if kind == "linked":  # Against another module: the immediate the game's linker wrote, read as it runs.
+        value = f"(rd32({prefix}_code + 0x{addend:x}u) & 0xffffu)"
+    else:
+        target = f"{prefix}_section[{section}]" if symbol is None else f"{prefix}_import[{symbol}]"
+        target = f"({target} + 0x{addend:x}u)"
+        value = {"lo": f"({target} & 0xffffu)", "hi": f"(({target}) >> 16)", "ha": f"((({target}) + 0x8000u) >> 16)"}[kind]
+    text = emit(address, (word & 0xffff0000) | FIELD_STAND_IN, name)
+    forms = [(f"0x{FIELD_STAND_IN << 16:x}u", f"({value} << 16)"), (f"0x{FIELD_STAND_IN:x}u", value),
+             (str(FIELD_STAND_IN), f"(int32_t)(int16_t){value}")]
+    found = [(literal, c) for literal, c in forms if text and literal in text]
+    if len(found) != 1 or text.count(found[0][0]) != 1:
+        raise SystemExit(f"{prefix}: can't place the linker's {kind} field in {name} at 0x{address:x}: {text}")
+    return text.replace(found[0][0], found[0][1])
+
+
+def write_if_changed(path, text):
+    """Keeps file times, so only changed parts are compiled again."""
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+
+
+def emit_function(program, start, body, starts):
+    if start in REPLACED:
+        reason, body_text = REPLACED[start]
+        return f"void {function_name(start)}(void) {{ /* {reason} */ {body_text} }}", set(), Counter()
+    lines, labels = [f"void {function_name(start)}(void) {{ POLL();"], set()
+    if start in TRACED:  # WII_RECOMP_EMIT_TRACE: each call of these is logged as the game runs (debug.c).
+        lines.append(f"{{ extern void debug_trace_call(unsigned); debug_trace_call(0x{start:x}u); }}")
+    ordered = sorted(body)
+    for address in ordered:
+        word = program.word(address)
+        target = branch_target(address, word)
+        if target and not target[1] and target[0] in body:
+            labels.add(target[0])
+
+    # Code is listed by address, and a function can start in the middle of that.
+    if ordered and ordered[0] != start:
+        labels.add(start)
+        lines.append(f"goto L_{start:x};")
+
+    # A line that falls through to code listed elsewhere needs a jump to it.
+    for position, address in enumerate(ordered):
+        following = address + 4
+        next_listed = ordered[position + 1] if position + 1 < len(ordered) else None
+        if following in body and next_listed != following:
+            labels.add(following)
+
+    unknown = Counter()
+    for position, address in enumerate(ordered):
+        word = program.word(address)
+        name = name_of(word)
+        if address in labels:
+            lines.append(f"L_{address:x}:;")
+        following = address + 4
+        # Control leaves this line unless the next address in the listing follows on.
+        next_listed = ordered[position + 1] if position + 1 < len(ordered) else None
+
+        if name in ("b", "bc"):
+            destination, is_call = branch_target(address, word)
+            before, test = ("", "1") if name == "b" else condition(word)
+            if is_call and destination == following:  # Only reads its own address, and isn't a call.
+                lines.append(f"{before} if ({test}) {{ cpu.lr = {address_text(following)}; }}")
+            elif is_call:
+                lines.append(f"{before} if ({test}) {{ cpu.lr = {address_text(following)}; {call_text(destination, starts)} }}")
+            elif destination in body:
+                check = "POLL(); " if destination <= address else ""
+                if destination in IDLE_LOOPS and destination <= address:
+                    check = "{ extern void idle_wait(void); idle_wait(); } "
+                lines.append(f"{before} if ({test}) {{ {check}goto L_{destination:x}; }}")
+            else:
+                lines.append(f"{before} if ({test}) {{ {tail_text(destination, starts)} }}")
+        elif name == "bclr":
+            before, test = condition(word)
+            if word & 1:  # blrl calls the address in the link register, then carries on here.
+                lines.append(f"{before} if ({test}) {{ uint32_t target = cpu.lr; cpu.lr = {address_text(following)}; dispatch(target); }}")
+            elif (target := constant_link(program, address, body)) is not None and test == "1":
+                # The link register was just set to a fixed address: a jump there, not a return.
+                lines.append(f"{before} {tail_text(target, starts)}")
+            else:
+                lines.append(f"{before} if ({test}) {{ return; }}")
+        elif name == "bcctr":
+            before, test = condition(word)
+            if word & 1:
+                lines.append(f"{before} if ({test}) {{ cpu.lr = {address_text(following)}; dispatch(cpu.ctr); }}")
+            else:
+                lines.append(f"{before} if ({test}) {{ dispatch(cpu.ctr); return; }}")
+        elif name == "sc":
+            lines.append(f"system_call(0x{address:x}u);")
+        elif name == "rfi":
+            lines.append("cpu.msr = cpu.spr[27]; dispatch(cpu.spr[26]); return;")
+        else:
+            if MODULE and address in MODULE["fields"]:
+                text = emit_field(address, word, name)
+            else:
+                text = emit(address, word, name) if name else None
+            if text is None:
+                unknown[name] += 1
+                lines.append(f'unimplemented(0x{address:x}u, "{name}");')
+            else:
+                lines.append(text)
+
+        ended = word in (0x4e800020, 0x4e800420, 0x4c000064) or (name == "b" and not word & 1)
+        if not ended and next_listed != following and following not in body:
+            lines.append(tail_text(following, starts))
+        elif not ended and next_listed != following:
+            lines.append(f"goto L_{following:x};")
+    lines.append("}")
+    return "\n".join(lines), labels, unknown
+
+
+def tail_text(destination, starts):
+    """A jump to other code. It must not grow the stack, as loops can span functions."""
+    if (program_target := program_function(destination)) is not None:
+        return f"__attribute__((musttail)) return {function_name(program_target)}();"
+    if destination in starts:
+        return f"__attribute__((musttail)) return {function_name(destination)}();"
+    return f"dispatch({address_text(destination)}); return;"
+
+
+def constant_link(program, address, body):
+    """The address `lis rS; addi/ori rS, rS; mtlr rS` just before this blr put in the link
+    register, or None. Code returns through a stub elsewhere this way."""
+    if not all(a in body for a in (address - 12, address - 8, address - 4)):
+        return None
+    high, low, move = (program.word(a) for a in (address - 12, address - 8, address - 4))
+    source = move >> 21 & 31
+    if move & 0xfc1fffff != 0x7c0803a6 or high >> 26 != 15 or high >> 16 & 31 or high >> 21 & 31 != source:
+        return None
+    if low >> 26 == 14 and low >> 21 & 31 == source and low >> 16 & 31 == source:
+        return ((high & 0xffff) << 16) + (low & 0xffff) - (0x10000 if low & 0x8000 else 0) & 0xffffffff
+    if low >> 26 == 24 and low >> 21 & 31 == source and low >> 16 & 31 == source:
+        return (high & 0xffff) << 16 | low & 0xffff
+    return None
+
+
+def call_text(destination, starts):
+    if (program_target := program_function(destination)) is not None:
+        return f"{function_name(program_target)}();"
+    return f"{function_name(destination)}();" if destination in starts else f"dispatch({address_text(destination)});"
+
+
+def check_replaced(starts):
+    """A replaced address that isn't a function start would silently never be used."""
+    missing = sorted(a for a in REPLACED if a not in starts)
+    if missing:
+        raise SystemExit("REPLACED addresses are not function starts: " + ", ".join(f"0x{a:08x}" for a in missing))
+
+
+def fnv1a64(data):
+    """The check the console makes on the program before running this title's code."""
+    value = 0xcbf29ce484222325
+    for byte in data:
+        value = ((value ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+    return value
+
+
+def program_length(data):
+    """A program file's size from its section table, without padding: the console checks this much."""
+    reach = [struct.unpack_from(">I", data, i * 4)[0] + struct.unpack_from(">I", data, 0x90 + i * 4)[0]
+             for i in range(18) if struct.unpack_from(">I", data, 0x90 + i * 4)[0]]
+    return max([0x100] + reach)
+
+
+APPLOADER_AT = 0x81200000  # Where every Wii apploader is loaded and run.
+
+
+def emit_apploader(system, out, program):
+    """The disc's apploader, which the Wii Menu runs to load the game, as native code.
+
+    Writes apploader.c and returns (code bytes, check, function count). A title with no
+    apploader, such as the Wii Menu itself, gets an empty list.
+    """
+    path = system / "apploader.img"
+    if not path.is_file():
+        write_if_changed(out / "apploader.c", '#include "../../runtime/title.h"\nconst TitleFunction title_apploader[] = {{0, 0}};\n')
+        return 0, 0, 0
+    data = path.read_bytes()
+    entry, size = struct.unpack_from(">II", data, 0x10)
+    code = data[0x20:0x20 + size]
+    if any(program.is_code(a) for a in (APPLOADER_AT, APPLOADER_AT + size - 4)):
+        raise SystemExit("the apploader overlaps the program's code")
+    header = bytearray(0x100)
+    struct.pack_into(">I", header, 0, 0x100)
+    struct.pack_into(">I", header, 0x48, APPLOADER_AT)
+    struct.pack_into(">I", header, 0x90, len(code))
+    struct.pack_into(">I", header, 0xe0, entry)
+    apploader = Program(bytes(header) + code)
+    functions, _ = find_functions(apploader)
+    add_unreached_code(apploader, functions)  # Its init, main and close are only ever stored.
+    saved = dict(REPLACED), dict(IDLE_LOOPS)  # The game's own rules don't apply to it.
+    REPLACED.clear()
+    IDLE_LOOPS.clear()
+    try:
+        addresses = sorted(functions)
+        starts = set(addresses)
+        parts = ['#include "../../runtime/title.h"'] + [f"void {function_name(a)}(void);" for a in addresses]
+        for start in addresses:
+            text, _, _ = emit_function(apploader, start, functions[start], starts)
+            parts.append(text)
+    finally:
+        REPLACED.update(saved[0])
+        IDLE_LOOPS.update(saved[1])
+    parts.append("const TitleFunction title_apploader[] = {" + ",".join(f"{{0x{a:x}u,{function_name(a)}}}" for a in addresses) + "};")
+    write_if_changed(out / "apploader.c", "\n".join(parts) + "\n")
+    print(f"apploader: {len(addresses)} functions")
+    return len(code), fnv1a64(code), len(addresses)
+
+
+def picture_scale():
+    """--scale N or N/D: the picture's size against the Wii's for this game, or (0, 0) for the console's own."""
+    if "--scale" not in sys.argv:
+        return 0, 0
+    text = sys.argv[sys.argv.index("--scale") + 1]
+    numerator, _, denominator = text.partition("/")
+    numerator, denominator = int(numerator), int(denominator or 1)
+    if denominator < 1 or not denominator <= numerator <= 4 * denominator:
+        sys.exit(f"--scale {text} isn't a scale from 1 to 4, such as 2 or 3/2")
+    return numerator, denominator
+
+
+def title_description(program_bytes, tmd, values, function_count, module_count, apploader, counting=False):
+    """What the console needs to know about this title, as the one symbol its library exports."""
+    high = int.from_bytes(tmd[TITLE_ID_OFFSET:TITLE_ID_OFFSET + 4], "big")
+    low = int.from_bytes(tmd[TITLE_ID_OFFSET + 4:TITLE_ID_OFFSET + 8], "big")
+    ios = int.from_bytes(tmd[IOS_OFFSET + 4:IOS_OFFSET + 8], "big")
+    return ('#include "../../runtime/title.h"\n'
+            "extern const TitleFunction title_functions[];\n"
+            "extern uint32_t title_counts[];\n"
+            "extern const Module *const title_modules[];\n"
+            "extern const TitleFunction title_apploader[];\n"
+            "__attribute__((visibility(\"default\"))) const Title wii_recomp_title = {\n"
+            f"  TITLE_INTERFACE, 0x{fnv1a64(program_bytes[:program_length(program_bytes)]):016x}ull, 0x{high:08x}u, 0x{low:08x}u, {ios},\n"
+            f"  0x{values.get('calibration_flag', 0):x}u,\n"
+            f"  {int('--virtual-bluetooth' in sys.argv)}, {int('--fifo-breakpoints' in sys.argv)}, {picture_scale()[0]}, {picture_scale()[1]},\n"
+            f"  title_functions, {function_count}, title_modules, {module_count},\n"
+            f"  0x{APPLOADER_AT if apploader[0] else 0:x}u, 0x{apploader[0]:x}u, 0x{apploader[1]:016x}ull, title_apploader, {apploader[2]},\n"
+            f"  {'title_counts' if counting else '0'},\n"
+            "};\n")
+
+
+# Each module's code stands in from MODULE_BASE on, one after another, with its imports
+# just after its code, within a branch's reach of all of it. Mario Party 9 has 115 modules,
+# 47 MiB of code, which a fixed 32 MiB each would take far past 32 bits.
+MODULE_BASE, MODULE_ALIGN = 0xc0000000, 0x10000
+
+
+def align_up(value, step):
+    return (value + step - 1) // step * step
+
+
+def module_imports_at(module, base):
+    """Where a module's import stand-ins start when its code stands in at `base`."""
+    return align_up(base + module.sections[module.code_section()][1], MODULE_ALIGN)
+
+
+def export_addresses(system, functions):
+    """What the program exports to its modules, by name, from its .sel export list.
+
+    The list gives each export as an offset into a section of the program, but not where
+    that section starts. A code section's start is the one that puts its exports on
+    functions the translator found. It must be clear-cut, or the build stops. The runtime
+    checks every address again once a module is linked.
+    """
+    starts = sorted(functions)
+    found = {}
+    files = system.parent / "files"
+    for path in sorted((system / "modules").glob("*.sel")) + (sorted(files.rglob("*.sel")) if files.is_dir() else []):
+        exported = modules.parse_rso(path.stem, path.read_bytes())
+        if not exported:
+            continue
+        by_section = {}
+        for name, section, value in exported.exports:
+            by_section.setdefault(section, []).append((name, value))
+        for section, entries in sorted(by_section.items()):
+            votes = Counter(start - value for _, value in entries[:40] for start in starts)
+            scored = sorted(((sum(base + value in functions for _, value in entries), base)
+                             for base, _ in votes.most_common(20)), reverse=True)
+            best, base = scored[0]
+            runner_up = scored[1][0] if len(scored) > 1 else 0
+            if best < max(3, len(entries) * 0.7) or runner_up * 2 > best:
+                print(f"{path.name}: section {section} isn't code the translator found ({best} of {len(entries)} exports)")
+                continue
+            print(f"{path.name}: section {section} starts at {base:08x}, {best} of {len(entries)} exports on known functions")
+            found.update({name: base + value for name, value in entries})
+    return found
+
+
+def title_modules(system):
+    """Every module the title loads at run time, as (source name, parsed module): the Wii
+    Menu's RSOs in sys/modules, then any REL in the disc's files. A disc keeps hundreds of
+    compressed archives, so only files named as modules are opened."""
+    found = [(path.name, modules.parse_rso(path.stem, path.read_bytes()))
+             for path in sorted((system / "modules").glob("*.rso"))]
+    files = system.parent / "files"
+    if files.is_dir():
+        for path in sorted(files.rglob("*")):
+            folders = {part.lower() for part in path.relative_to(files).parts[:-1]}
+            if path.is_file() and (MODULE_FILE.search(path.name) or folders & MODULE_FOLDERS):
+                found += [(str(path.relative_to(files)), module) for module in modules.find_modules([(path.name, path.read_bytes())])
+                          if not modules.is_export_list(module)]
+    return [(name, module) for name, module in found if module]
+
+
+# A file that holds modules: a .rel or .rso, or an archive of them (RELS.arc and the like).
+# A folder whose files are modules whatever they're called, such as Super Paper Mario's
+# rel/rel.bin, or Mario Sports Mix's Module/Final/*.cmp. Only files that read as a module
+# are taken from it.
+MODULE_FOLDERS = {"rel", "rels", "module", "modules"}
+MODULE_FILE = re.compile(r"\.(rel|rso)(\.[a-z0-9]+)?$|^rels?\b.*\.(arc|szs)$", re.IGNORECASE)
+
+
+def module_imports(found):
+    """Names each RSO module calls in the program, which must be native functions."""
+    return {module.imports[r.symbol] for _, module in found if module.kind == "rso"
+            for r in module.external if r.kind == modules.REL24}
+
+
+def module_program_calls(found):
+    """Program addresses each REL module branches to, which must be native functions."""
+    return {r.addend for _, module in found if module.kind == "rel" for r in module.fixed if r.kind == modules.REL24}
+
+
+def links_between(found):
+    """{module number: code offsets} that other REL modules branch or point to, which are
+    function starts there even when nothing inside the module leads to them."""
+    by_id = {module.module_id: module for _, module in found if module.kind == "rel" and module.module_id}
+    starts = {}
+    for _, module in found:
+        for reloc in module.external if module.kind == "rel" else ():
+            target, section = reloc.symbol
+            other = by_id.get(target)
+            if not other or reloc.kind not in (modules.REL24, modules.ADDR32) or section not in other.executable:
+                continue
+            if len(other.executable) == 1:
+                starts.setdefault(target, set()).add(reloc.addend)
+    return starts
+
+
+def emit_module(module, number, base, imports, out, exports, program_starts, counts, extra_starts=()):
+    """Translates a run-time-loaded module's code into native functions, wherever it is
+    loaded. Writes m<number>_*.c and returns the C for its entry in the module table, or
+    None if the module can't be prepared, which leaves it to the interpreter.
+
+    `counts` is None to compile every function for speed, or {offset: runs} from earlier
+    runs: functions that did the work compile for speed, the rest quickly, counting runs
+    into m<number>_counts."""
+    global MODULE
+    try:
+        prepared = modules.prepare(module, base, imports, extra_starts)
+    except modules.Unsupported as reason:
+        print(f"{module.name}: left to the interpreter, {reason}")
+        return None
+    header = bytearray(0x100)
+    struct.pack_into(">I", header, 0, 0x100)
+    struct.pack_into(">I", header, 0x48, base)
+    struct.pack_into(">I", header, 0x90, len(prepared.code))
+    struct.pack_into(">I", header, 0xe0, base)
+    program = Program(bytes(header) + prepared.code)
+    functions = {}
+    add_starts(program, functions, prepared.starts)
+    prefix = f"m{number}"
+    import_count = len(module.imports) + len(prepared.fixed_calls) + len(prepared.linked_calls)
+    fixed = {imports + 4 * n: address for n, address in prepared.fixed_calls.items()}
+    linked = {imports + 4 * n: at for n, at in prepared.linked_calls.items()}
+    # An RSO's call to something the program doesn't export goes to another module, or to
+    # itself. The game links those again whenever a module comes or goes (Mario Sports Mix's
+    # system module calls into whichever sport is loaded), so the branch is read each time.
+    late = {index for index, site in prepared.import_sites.items()
+            if module.kind != "rel" and site[0] == "branch" and module.imports[index] not in exports}
+    linked.update({imports + 4 * index: prepared.import_sites[index][1] for index in late})
+    MODULE = {"prefix": prefix, "base": base, "size": len(prepared.code), "imports": imports, "linked": linked,
+              "import_count": import_count, "fields": prepared.fields, "fixed": fixed, "program": program_starts}
+    counting = counts is not None
+    try:
+        addresses = sorted(functions)
+        fast = choose_fast({base + offset: runs for offset, runs in counts.items()}) if counting else set(addresses)
+        called = sorted({address for address in fixed.values() if address in program_starts})
+        declarations = "\n".join(f"void {function_name(a)}(void);" for a in addresses + called)
+        counter = (f"extern uint32_t {prefix}_counts[];\n"
+                   f"#define POLL_COUNTED(i) do {{ {prefix}_counts[i]++; POLL(); }} while (0)\n")
+        write_if_changed(out / f"{prefix}_functions.h",
+                         f'#include "../../runtime/modules.h"\nextern uint32_t {prefix}_code, {prefix}_section[], {prefix}_import[];\n'
+                         f"{counter}{declarations}\n")
+        written, unknown = write_groups(program, functions, addresses, fast, out, prefix=prefix)
+    finally:
+        MODULE = None
+    code_start = module.sections[prepared.section][0]
+    export_offsets = [offset for _, section, offset in module.exports if section == prepared.section]
+    sites = []
+    for index in range(import_count):
+        site = prepared.import_sites.get(index)
+        if site is None:
+            sites.append("{0, 0, 0, 0, 0}")
+        elif index in late:
+            sites.append("{0, 0, 0, 0, 0}")
+        elif site[0] == "branch":
+            sites.append(f"{{1, 0x{site[1]:x}u, 0, 0, 0x{exports.get(module.imports[index], 0):x}u}}")
+        elif site[0] == "fixed":
+            sites.append(f"{{3, 0x{site[1]:x}u, 0, 0, 0x{site[2]:x}u}}")
+        else:
+            sites.append(f"{{2, 0x{site[1]:x}u, 0x{site[2]:x}u, 0x{site[3]:x}u, 0x{exports.get(module.imports[index], 0):x}u}}")
+    layout = REL_LAYOUT if module.kind == "rel" else RSO_LAYOUT
+    table_at = modules.REL_HEADER_BYTES[modules.big32(module.data, 0x1c)] if module.kind == "rel" else modules.HEADER_BYTES
+    lines = [f'#include "{prefix}_functions.h"', '#include "../../runtime/modules.h"',
+             f"uint32_t {prefix}_code, {prefix}_section[{len(module.sections)}], {prefix}_import[{max(1, import_count)}];",
+             f"uint32_t {prefix}_counts[{max(1, len(addresses))}];",
+             f"static const ModuleFunction {prefix}_functions[] = {{" + ",".join(
+                 f"{{0x{a - base:x}u,{function_name(a)}}}" for a in addresses) + "};",
+             f"static const uint32_t {prefix}_exports[] = {{" + ",".join(f"0x{e:x}u" for e in export_offsets or [0]) + "};",
+             f"static const uint32_t {prefix}_relocated[] = {{" + ",".join(
+                 f"0x{r:x}u" for r in sorted(prepared.relocated_words)) + "};",
+             f"static const ImportSite {prefix}_sites[] = {{" + ",".join(sites or ["{0, 0, 0, 0, 0}"]) + "};"]
+    entry = (f'{{"{module.name}", 0x{code_start:x}u, 0x{len(prepared.code):x}u, {len(module.sections)}, {prepared.section}, '
+             f"{layout[0]}, {layout[1]}, 0x{table_at:x}u, {module.module_id}u, "
+             f"{prefix}_functions, {len(addresses)}, {prefix}_exports, {len(export_offsets)}, "
+             f"{prefix}_relocated, {len(prepared.relocated_words)}, 0x{prepared.check:x}ull, "
+             f"{prefix}_sites, {import_count}, &{prefix}_code, {prefix}_section, {prefix}_import, "
+             f"{prefix + '_counts' if counting else '0'}}}")
+    lines.append(f"const Module {prefix}_module = {entry};")
+    write_if_changed(out / f"{prefix}_table.c", "\n".join(lines) + "\n")
+    fast_count = len(fast & set(addresses))
+    print(f"{module.name}: {len(addresses)} functions in {len(written)} files, {len(called)} program functions called directly"
+          + (f", {fast_count} compiled for speed and {len(addresses) - fast_count} quickly" if counting else ""))
+    if unknown:
+        print(f"{module.name} not yet translated:", unknown.most_common(20))
+    return prefix
+
+
+# Where a linked module's header gives its section count and section table.
+RSO_LAYOUT, REL_LAYOUT = (0x08, 0x0c), (0x0c, 0x10)
+
+
+def write_modules(found, out, exports, program_starts, module_counts=None):
+    """Every module the title loads at run time as native code, where it can be prepared.
+    `module_counts` is {module name: {offset: runs}} when building in two tiers."""
+    prefixes = []
+    base = MODULE_BASE
+    between = links_between(found)
+    for number, (_, module) in enumerate(found):
+        counts = None if module_counts is None else module_counts.get(module.name, {})
+        extra = between.get(module.module_id, ()) if module.kind == "rel" else ()
+        try:
+            imports = module_imports_at(module, base)  # Finds the code section, which can't always be told.
+        except modules.Unsupported as reason:
+            print(f"{module.name}: left to the interpreter, {reason}")
+            imports, prefix = base, None
+        else:
+            prefix = emit_module(module, number, base, imports, out, exports, program_starts, counts, extra)
+        # Room for every import stand-in: the module's own, and one per program or module
+        # function it branches to, which is at most one per relocation.
+        stand_ins = len(module.imports) + len(module.fixed) + len(module.external)
+        base = align_up(imports + 4 * stand_ins, MODULE_ALIGN) + MODULE_ALIGN
+        if base >= 0xfff00000:
+            raise SystemExit("the modules' code doesn't fit in the stand-in space")
+        if prefix is None:
+            for stale in out.glob(f"m{number}_*"):
+                stale.unlink()
+        else:
+            prefixes.append(prefix)
+    for stale in out.glob("m*_*.[ch]"):  # From a build with more modules.
+        if re.fullmatch(r"m(\d+)_.*", stale.name) and f"m{stale.name[1:].split('_')[0]}" not in prefixes:
+            stale.unlink()
+    write_if_changed(out / "modules.c", '#include "../../runtime/modules.h"\n'
+                     + "".join(f"extern const Module {prefix}_module;\n" for prefix in prefixes)
+                     + f"const Module *const title_modules[] = {{{', '.join(f'&{p}_module' for p in prefixes) or '0'}}};\n")
+    return len(prefixes)
+
+
+# What a group needs, set before the worker processes fork so they share it unpickled.
+_GROUP_INPUT = None
+
+
+def group_texts(group_number):
+    """The C of one group's functions, by tier, and the instructions not yet translated."""
+    program, functions, addresses, fast, starts = _GROUP_INPUT
+    tiers, unknown = {"part": [], "cold": []}, Counter()
+    first = group_number * FUNCTIONS_PER_FILE
+    for index in range(first, min(first + FUNCTIONS_PER_FILE, len(addresses))):
+        start = addresses[index]
+        text, _, missing = emit_function(program, start, functions[start], starts)
+        unknown += missing
+        if start in fast:
+            tiers["part"].append(text)
+        else:
+            tiers["cold"].append(text.replace("POLL();", f"POLL_COUNTED({index});"))
+    return tiers, unknown
+
+
+def write_groups(program, functions, addresses, fast, out, jobs=None, prefix=""):
+    """Writes the functions, FUNCTIONS_PER_FILE to a group by address: those in `fast` to
+    part<group>.c and the rest, counting their runs, to cold<group>.c. Groups don't move
+    when tiers change, so a function changing tier rewrites only its own group's files.
+    Groups are written on every core where processes can fork. A module's groups are
+    m<n>_part<group>.c and so on, with `prefix` m<n>. Returns the file names written and
+    the instructions not yet translated."""
+    global _GROUP_INPUT
+    _GROUP_INPUT = (program, functions, addresses, fast, set(addresses))
+    groups = range((len(addresses) + FUNCTIONS_PER_FILE - 1) // FUNCTIONS_PER_FILE)
+    jobs = jobs or os.cpu_count() or 1
+    if jobs > 1 and len(groups) > 1 and "fork" in multiprocessing.get_all_start_methods():
+        with multiprocessing.get_context("fork").Pool(jobs) as pool:
+            results = pool.map(group_texts, groups, chunksize=4)
+    else:
+        results = map(group_texts, groups)
+    unknown = Counter()
+    written = set()
+    lead, header = (f"{prefix}_", f"{prefix}_functions.h") if prefix else ("", "functions.h")
+    for group_number, (tiers, missing) in zip(groups, results):
+        unknown += missing
+        for tier, texts in tiers.items():
+            if texts:
+                name = f"{lead}{tier}{group_number:04}.c"
+                write_if_changed(out / name, "\n".join([f'#include "{header}"'] + texts) + "\n")
+                written.add(name)
+    pattern = re.compile(re.escape(lead) + GROUP_FILE.pattern)
+    for stale in out.glob("*.c"):  # Groups from an earlier build with other tiers or fewer functions.
+        if pattern.fullmatch(stale.name) and stale.name not in written:
+            stale.unlink()
+    return written, unknown
+
+
+# Functions in the quick tier count their runs into title_counts, by their index in the table.
+COUNTING = ("extern uint32_t title_counts[];\n"
+            "#define POLL_COUNTED(i) do { title_counts[i]++; POLL(); } while (0)\n")
+
+
+def option_values(name):
+    """Every value given after `name` on the command line."""
+    return [sys.argv[i + 1] for i, item in enumerate(sys.argv[:-1]) if item == name]
+
+
+def read_profile(path):
+    """{address: count} for the program's functions from a console's profile.txt. A missing
+    file gives none."""
+    return read_counts(path)[0]
+
+
+def read_counts(path):
+    """The program's counts, {address: count}, and its modules', {module name: {offset:
+    count}}, from a console's profile.txt. Module functions are kept as <name>+<offset>,
+    as a module can be loaded anywhere."""
+    counts, module_counts = {}, {}
+    if not path.exists():
+        return counts, module_counts
+    for line in path.read_text().splitlines():
+        if line and not line.startswith("#"):
+            place, count = line.split()
+            if "+" in place:
+                name, offset = place.rsplit("+", 1)
+                own = module_counts.setdefault(name, {})
+                own[int(offset, 16)] = own.get(int(offset, 16), 0) + int(count)
+            else:
+                counts[int(place, 16)] = counts.get(int(place, 16), 0) + int(count)
+    return counts, module_counts
+
+
+def choose_fast(counts):
+    """Every function that ran in a profiled session. Most of the runs are in a few hundred
+    functions, but code that runs once, as a race or a level starts, matters too: left in
+    the quick tier it made a 160 ms hitch at the start of Mario Kart Wii's first race.
+    Code that never ran stays quick to compile."""
+    return {address for address, count in counts.items() if count > 0}
+
+
+def virtual_bluetooth_keeps(entry):
+    """Whether the program's own code stays for this entry with --virtual-bluetooth."""
+    return (entry.get("body") in DIRECT_INPUT or "Bluetooth" in entry["name"] or entry["name"].startswith("KPADRead")
+            or entry.get("group") == "board")
+
+
+def main():
+    dol = Path(sys.argv[1])
+    program = Program(dol.read_bytes())
+    out = Path(sys.argv[2])
+    out.mkdir(parents=True, exist_ok=True)
+    functions, _ = find_functions(program)
+    entries = load_entries()
+    board = {entry["reason"] for entry in entries if entry.get("group") == "board"}
+    if "--virtual-bluetooth" in sys.argv:
+        # What's dropped below needn't be found at all: a program may have no KPAD, as some
+        # channels haven't, and nothing of it would be replaced anyway.
+        entries = [dict(entry, group="optional") if virtual_bluetooth_keeps(entry) else entry for entry in entries]
+    replaced, idle_loops, values = resolve(program, functions, entries)
+    if "--virtual-bluetooth" in sys.argv:
+        # The program's own controller code runs, including an older KPADRead left as a stub,
+        # and so does its board code, which the simulated board answers. WPADRead reads the
+        # remote too, so standing in for it with the board's sensors blanks the remote.
+        # The board's entries are told apart by their reasons, noted before they were made
+        # optional above.
+        replaced = {address: entry for address, entry in replaced.items()
+                    if entry[1] not in DIRECT_INPUT and "Bluetooth" not in entry[0] and not entry[0].startswith("KPADRead")
+                    and entry[0] not in board}
+    REPLACED.update(replaced)
+    IDLE_LOOPS.update(idle_loops)
+    for path in option_values("--discovered"):
+        add_starts(program, functions, read_starts(Path(path)))
+    (out / "game.c").unlink(missing_ok=True)  # Written by earlier versions, before titles were libraries.
+    # After resolving, as finding a function can depend on counting its neighbours.
+    if "--all-code" in sys.argv:
+        add_unreached_code(program, functions)
+    # Program functions only its run-time modules call: by name from its export list for
+    # RSOs, by address for RELs.
+    found = title_modules(dol.parent)
+    exports = export_addresses(dol.parent, functions)
+    called = module_imports(found) if exports else set()
+    program_calls = {a for a in module_program_calls(found) if program.is_code(a)}
+    add_starts(program, functions, program_calls)
+    unplaced = sorted(name for name in called if name not in exports)
+    if unplaced:  # The runtime checks each has native code once a module is linked.
+        print("module calls placed only at run time:", ", ".join(unplaced))
+    add_starts(program, functions, {exports[name] for name in called if name in exports})
+    starts = set(functions)
+    check_replaced(starts)
+    addresses = sorted(starts)
+    declarations = "\n".join(f"void {function_name(a)}(void);" for a in addresses)
+    write_if_changed(out / "functions.h", f'#include "../../runtime/cpu.h"\n{COUNTING}{declarations}\n')
+
+    profile = option_values("--profile")
+    counting = bool(profile)
+    program_counts, module_counts = read_counts(Path(profile[-1])) if counting else ({}, None)
+    fast = choose_fast(program_counts) if counting else set(addresses)
+    written, unknown = write_groups(program, functions, addresses, fast, out)
+
+    table = ",\n".join(f"{{0x{a:x}u, {function_name(a)}}}" for a in addresses)
+    counts = f"uint32_t title_counts[{len(addresses)}];\n" if counting else ""
+    write_if_changed(
+        out / "table.c",
+        '#include "functions.h"\n#include "../../runtime/title.h"\n'
+        f"const TitleFunction title_functions[] = {{\n{table}\n}};\n{counts}",
+    )
+    fast_count = len(fast & starts)
+    print(f"{len(addresses)} functions in {len(written)} files" +
+          (f", {fast_count} compiled for speed and {len(addresses) - fast_count} quickly" if counting else ""))
+    print("not yet translated:", unknown.most_common(40))
+    module_count = write_modules(found, out, exports, starts, module_counts)
+    apploader = emit_apploader(dol.parent, out, program)
+    write_if_changed(out / "title.c", title_description(dol.read_bytes(), (dol.parent.parent / "tmd.bin").read_bytes(), values,
+                                                        len(addresses), module_count, apploader, counting))
+
+
+if __name__ == "__main__":
+    main()

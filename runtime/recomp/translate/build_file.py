@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Write the ninja file that compiles the console and the translated title.
+
+Usage: recomp/translate/build_file.py recomp/build [backend,backend]
+
+It builds two things: `wii-recomp`, the console, which is the same for every title, and
+`title.dylib` (`title.so` on Linux), the title's translated code, which the console loads.
+
+Backends are the graphics APIs to build in, the first being the default at run
+time. WII_RECOMP_RENDERER picks among them. Without a list, each platform's usual ones,
+leaving Vulkan out where its libraries aren't installed. VULKAN_SDK names a folder
+holding the Vulkan libraries and headers, if they aren't installed system-wide.
+"""
+import hashlib
+import os
+import re
+import sys
+from glob import glob
+from pathlib import Path
+
+VULKAN_SDK = os.environ.get("VULKAN_SDK")
+WINDOWS = sys.platform == "win32"
+# Windows builds with MSYS2's clang (the CLANG64 packages), found through MSYS2_ROOT or
+# in its usual place. Its libraries and headers are in that one folder.
+MSYS2 = Path(os.environ.get("MSYS2_ROOT", "C:/msys64")) / "clang64"
+CLANG = (MSYS2 / "bin/clang.exe").as_posix() if WINDOWS else "clang"
+# Arm's C leaves char unsigned and merges multiply-adds, both unlike the Intel Mac.
+FLAGS = "-w -fno-strict-aliasing -fwrapv -fsigned-char -ffp-contract=off " + ("-I../runtime/win" if WINDOWS else "-I/usr/local/include") + (f" -I{VULKAN_SDK}/include" if VULKAN_SDK else "")
+GAME_OPTIMIZATION = "-O2"
+# The quick tier (emit.py --profile): code that hasn't run in a profiled session yet. It
+# used to be -O0, five times quicker to compile, but code first run in play (a match, a
+# race) then ran so slowly that the game stuttered: Mario Strikers Charged's first match
+# fell to 50 fps. At -O2 a whole game builds in about half a minute on a desktop.
+QUICK_OPTIMIZATION = "-O2"
+RUNTIME_OPTIMIZATION = "-O3"
+import platform as _platform
+if WINDOWS or (sys.platform == "linux" and _platform.machine() == "x86_64"):
+    FLAGS += " -march=x86-64-v3"  # AVX2 and FMA-capable processors: Haswell and Zen onwards.
+if sys.platform == "linux" and os.uname().machine == "aarch64":
+    FLAGS += " -mcpu=cortex-a76"  # The Raspberry Pi 5.
+COMMON_LINK_FLAGS = "-L/usr/local/lib -lglfw -lm -lpthread"
+VULKAN_LINK_FLAGS = (f"-L{VULKAN_SDK}/lib -Wl,-rpath,{VULKAN_SDK}/lib " if VULKAN_SDK else "") + "-lvulkan"
+SHADERC = "shaderc" if sys.platform == "linux" else "shaderc_shared"  # Debian's name for it.
+VULKAN_LINK_FLAGS += f" -l{SHADERC}"
+
+# For each platform, what it always links, and what each backend adds. Every platform
+# draws at twice the Wii's size unless WII_RECOMP_SCALE asks otherwise (gx.h).
+PLATFORMS = {
+    "darwin": {"system": "-framework AudioToolbox -framework IOKit -framework CoreFoundation -lobjc", "opengl": "-framework OpenGL", "vulkan": VULKAN_LINK_FLAGS, "default": ["vulkan", "opengl"]},
+    "linux": {"system": "-lasound", "opengl": "-lGL", "vulkan": VULKAN_LINK_FLAGS, "default": ["vulkan"]},
+    "win32": {"system": "-lws2_32 -lwinmm", "opengl": "-lopengl32", "vulkan": "-lvulkan-1.dll -lshaderc_shared", "default": ["vulkan"]},
+}
+if WINDOWS:
+    COMMON_LINK_FLAGS = "-lglfw3 -lm -lpthread"
+LIBRARY_SUFFIX = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
+PROGRAM = "wii-recomp.exe" if WINDOWS else "wii-recomp"
+# The console must export what translated code calls, and the title must be able to call it.
+# On Windows a library names what it takes from the program at link time, so the console
+# writes an import library, and the title links against it and exports only its description.
+CONSOLE_LINK_FLAGS = {"darwin": "", "linux": "-rdynamic -ldl", "win32": "-Wl,--export-all-symbols -Wl,--out-implib,libconsole.a"}
+TITLE_LINK_FLAGS = {"darwin": "-shared -undefined dynamic_lookup", "linux": "-shared", "win32": "-shared ../translate/title.def ../build/libconsole.a"}
+# What the console and a title share. A title built against other versions is refused.
+INTERFACE_HEADERS = ["cpu.h", "guest_memory.h", "title.h", "modules.h"]
+AUDIO_SOURCES = {"darwin": "audio_output_mac.c", "linux": "audio_output_linux.c", "win32": "audio_output_win.c"}
+# The network uses POSIX sockets and fork; Windows has net_win.c in their place for now.
+NETWORK_SOURCES = {"win32": ["net_win.c"]}
+POSIX_NETWORK_SOURCES = ["net_ip.c", "net_ssl.c", "net_routes.c"]
+# Real Wii Remotes: IOKit's HID on the Mac, Bluetooth sockets and the kernel's HID on Linux (remote_link.h).
+REMOTE_SOURCES = {"darwin": ["remote_link_mac.c"], "linux": ["remote_link_linux.c", "remote_link_hidraw.c"], "win32": ["remote_link_win.c"]}
+BACKEND_SOURCES = {"opengl": ["gx_gl.c"], "vulkan": ["gx_vulkan.c", "gx_vulkan_device.c", "gx_vulkan_ngx.c", "gx_vulkan_pipeline.c", "gx_vulkan_window.c"]}
+LIBRARY_FOLDERS = ["/usr/local/lib", "/usr/lib", "/usr/lib/aarch64-linux-gnu"] + ([f"{VULKAN_SDK}/lib"] if VULKAN_SDK else [])
+# SDL3 reads Switch and other controllers (runtime/pads.c). On a Mac it's Homebrew's; on
+# Linux, recomp/tools/sdl3_setup.sh builds it into /usr/local, or ~/.local without root.
+SDL3_PREFIXES = [os.environ.get("SDL3_PREFIX"), "/usr/local", str(Path.home() / ".local"), "/usr"]
+
+
+def sdl3_flags():
+    """(compile flags, link flags) for SDL3, or stops with how to install it."""
+    if WINDOWS:
+        if not (MSYS2 / "include/SDL3/SDL.h").exists():
+            sys.exit(f"stop: SDL3 isn't in {MSYS2}. Install MSYS2's CLANG64 packages: see docs/windows.md.")
+        return "", "-lSDL3"
+    for prefix in filter(None, SDL3_PREFIXES):
+        libraries = [Path(found).parent for found in glob(f"{prefix}/lib*/libSDL3.*") + glob(f"{prefix}/lib/*/libSDL3.*")]
+        if libraries and Path(f"{prefix}/include/SDL3/SDL.h").exists():
+            folder = libraries[0]
+            compile_flags = "" if prefix == "/usr" else f"-I{prefix}/include"
+            link_flags = "-lSDL3" if prefix == "/usr" else f"-L{folder} -Wl,-rpath,{folder} -lSDL3"
+            return compile_flags, link_flags
+    install = "brew install sdl3" if sys.platform == "darwin" else "recomp/tools/sdl3_setup.sh"
+    sys.exit(f"stop: SDL3 isn't installed, and the console reads controllers through it. Install it with {install}.")
+VULKAN_LIBRARIES = ["vulkan", SHADERC]
+
+
+def has_library(name):
+    if WINDOWS:
+        return bool(glob(f"{MSYS2.as_posix()}/lib/lib{name}*"))
+    return any(glob(f"{folder}/lib{name}.*") for folder in LIBRARY_FOLDERS)
+
+
+def default_backends(platform):
+    wanted = platform["default"]
+    missing = [name for name in VULKAN_LIBRARIES if not has_library(name)]
+    if "vulkan" in wanted and missing and len(wanted) > 1:
+        print("leaving Vulkan out, as these aren't installed:", ", ".join(missing))
+        return [backend for backend in wanted if backend != "vulkan"]
+    return wanted
+
+
+def interface_check(runtime):
+    digest = hashlib.sha256()
+    for name in INTERFACE_HEADERS:
+        digest.update((runtime / name).read_bytes())
+    return f"-DTITLE_INTERFACE=0x{digest.hexdigest()[:16]}ull"
+
+
+def main():
+    build = Path(sys.argv[1])
+    interface = interface_check(build / "../runtime")
+    generated = sorted((build / "generated").glob("*.c"))
+    platform = PLATFORMS[sys.platform]
+    backends = sys.argv[2].split(",") if len(sys.argv) > 2 else default_backends(platform)
+    sdl_compile, sdl_link = sdl3_flags()
+    link_flags = " ".join([COMMON_LINK_FLAGS, sdl_link, platform["system"]] + [platform[backend] for backend in backends])
+    defines = " ".join(f"-DGX_WITH_{backend.upper()}" for backend in backends) + f" -DGX_FIRST_{backends[0].upper()} " + platform.get("defines", "")
+    left_out = {name for backend, names in BACKEND_SOURCES.items() if backend not in backends for name in names}
+    left_out |= {name for system, name in AUDIO_SOURCES.items() if system != sys.platform}
+    left_out |= {name for system, names in REMOTE_SOURCES.items() if system != sys.platform for name in names}
+    left_out |= {name for system, names in NETWORK_SOURCES.items() if system != sys.platform for name in names}
+    if sys.platform in NETWORK_SOURCES:
+        left_out |= set(POSIX_NETWORK_SOURCES)
+    python = Path(sys.executable).as_posix()
+    embed = Path(__file__).resolve().with_name("embed.py").as_posix()
+    runtime_flags = "-include ../runtime/win/win_compat.h" if WINDOWS else ""
+    title_inputs = ""  # The console is built first (add_game.py); its import library is in recomp/build.
+    console_outputs = " | libconsole.a" if WINDOWS else ""
+    lines = [f"cflags = {FLAGS}", "",
+             "rule cc", f"  command = {CLANG} $cflags -c $in -o $out", "  description = $in", "",
+             # The runtime's headers change, and files that include them must follow.
+             "rule runtime_cc", f"  command = {CLANG} $cflags -MMD -MF $out.d -c $in -o $out", "  description = $in",
+             "  depfile = $out.d", "  deps = gcc", "",
+             # Data the console carries inside, such as the audio processor's ROM.
+             "rule embed", f"  command = {python} {embed} $in $out $symbol",
+             "  description = $in", "",
+             "rule link", f"  command = {CLANG} $in -o $out {link_flags} {CONSOLE_LINK_FLAGS[sys.platform]}", "",
+             "rule link_title", f"  command = {CLANG} $in -o $out {TITLE_LINK_FLAGS[sys.platform]}", ""]
+    title_objects, objects = [], []
+    for source in generated:
+        target = f"obj/{source.stem}.o"
+        # Hidden, so calls within the title stay direct; only its description is exported.
+        optimization = QUICK_OPTIMIZATION if re.match(r"(m\d+_)?cold", source.name) else GAME_OPTIMIZATION
+        lines.append(f"build {target}: cc generated/{source.name}\n  cflags = {optimization} {FLAGS} -fPIC -fvisibility=hidden {interface}")
+        title_objects.append(target)
+    for source in sorted(Path(build / "../runtime").glob("*.c")):
+        if source.name in left_out:
+            continue
+        target = f"obj/runtime_{source.stem}.o"
+        lines.append(f"build {target}: runtime_cc ../runtime/{source.name}\n  cflags = {RUNTIME_OPTIMIZATION} {FLAGS} {runtime_flags} {sdl_compile} {defines} {interface}")
+        objects.append(target)
+    for data in sorted(Path(build / "../runtime/data").glob("*.bin")):
+        symbol = f"data_{data.stem}"
+        lines.append(f"build obj/{symbol}.c: embed ../runtime/data/{data.name}\n  symbol = {symbol}")
+        lines.append(f"build obj/{symbol}.o: cc obj/{symbol}.c")
+        objects.append(f"obj/{symbol}.o")
+    lines.append(f"build {PROGRAM}{console_outputs}: link {' '.join(objects)}")
+    lines.append(f"build title.{LIBRARY_SUFFIX}: link_title {' '.join(title_objects)}{title_inputs}")
+    (build / "build.ninja").write_text("\n".join(lines) + "\n")
+    print(len(objects), "console objects,", len(title_objects), "title objects")
+
+
+if __name__ == "__main__":
+    main()

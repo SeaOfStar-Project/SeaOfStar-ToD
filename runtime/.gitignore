@@ -1,0 +1,48 @@
+# Disc images and anything extracted from them stay on your machine.
+*.rvz
+*.iso
+*.wbfs
+extracted/
+extracted.partial/
+.tools/
+roms/
+
+# Left over from the browser version: converted game assets and saved progress.
+web/
+data/
+# Except the audio processor's free boot ROM and filter table, which Dolphin ships.
+!recomp/runtime/data/
+node_modules/
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# Wii storage backups hold personal data and the console's unique keys.
+nand/
+# wii/ holds your own Wii's BootMii backup (nand.bin, keys.bin) and the storage
+# decrypted from it (wii/nand/). Never committed, wherever those files end up.
+wii/*
+!wii/README.md
+nand.bin
+keys.bin
+*.wad
+
+# Translated games are the game in another form, so they stay on your machine.
+recomp/build/
+recomp/build-*/
+
+# Local tool settings.
+.claude/
+
+# FIFO recordings hold the game's textures and models.
+*.dff
+
+# Recompiled disc images hold the whole game.
+*.wrd
+
+# What add_game.py packs, and the console folders the Wii Menu runs from. Only the top
+# folder: autoplay's per-game sessions live in recomp/tools/autoplay/games.
+/games/
+console/
+.ruff_cache/

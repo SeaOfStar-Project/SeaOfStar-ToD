@@ -1,0 +1,2 @@
+SO3EE9 = Rune Factory: Tides of Destiny
+# Local seed for DolRecomp. Replace with the full GameTDB titles.txt if available.

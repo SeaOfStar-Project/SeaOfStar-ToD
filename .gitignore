@@ -1,0 +1,65 @@
+# Local working notes (not published)
+/CLAUDE.md
+/handover.md
+/.claude/
+/work/
+
+# User-supplied game data
+game/*
+!game/README.md
+*.iso
+*.wbfs
+*.rvz
+*.wia
+*.dol
+*.rel
+*.sel
+*.app
+*.dff
+*.dtm
+*.wav
+
+# Local configuration (absolute local paths)
+config/game.json
+config/launcher.ini
+config/setup-state.json
+config/controllers.ini
+config/sd-keys.txt
+controllers.ini
+
+# Generated and build output (repository root only; runtime/ has its own rules)
+/extracted/
+/generated/
+/build/
+/out/
+/logs/
+/analysis/*
+!/analysis/README.md
+
+# Game-derived or machine-specific data
+*.wrd
+shaders.bin
+profile.txt
+native-cache/
+saves/
+*.sav
+ui-shots/
+*.log
+# Pictures are game captures unless they are documentation
+*.png
+*.jpg
+*.jpeg
+*.ppm
+*.bmp
+!docs/**/*.png
+!docs/**/*.jpg
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+__pycache__/

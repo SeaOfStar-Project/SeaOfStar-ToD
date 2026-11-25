@@ -1,0 +1,29 @@
+{
+  "game": {
+    "name": "Rune Factory: Tides of Destiny",
+    "titleId": "SO3EE9",
+    "region": "USA",
+    "disc": "game/SO3EE9.rvz",
+    "extracted": "extracted/SO3EE9"
+  },
+  "recomp": {
+    "tool": "dolrecomp",
+    "mainDol": "extracted/SO3EE9/sys/main.dol",
+    "relDir": "extracted/SO3EE9/files/rel",
+    "output": "generated",
+    "map": "",
+    "config": ""
+  },
+  "runtime": {
+    "backend": "custom",
+    "graphics": "vulkan",
+    "scale": 2,
+    "widescreen": false,
+    "unlockFps": false
+  },
+  "paths": {
+    "work": "work",
+    "build": "build",
+    "logs": "logs"
+  }
+}

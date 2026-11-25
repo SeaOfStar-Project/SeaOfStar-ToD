@@ -1,0 +1,184 @@
+# The recompiler
+
+`translate/` turns a game's PowerPC program into C, and `runtime/` is the native console it runs on. The top-level `README.md` has the overview and the build steps.
+
+Everything in `recomp/build/` is a game in another form, so it stays on your machine and out of the repo.
+
+Needs `extracted/` from `recomp/tools/extract_disc.py`, plus `clang`, `ninja` and GLFW (`brew install glfw`). The second argument is a Wii storage folder, such as Dolphin's NAND folder after its system update.
+
+```sh
+python3 recomp/translate/emit.py extracted/sys/main.dol recomp/build/generated
+python3 recomp/translate/build_file.py recomp/build
+mkdir -p recomp/build/obj
+(cd recomp/build && ninja)
+recomp/build/wii-recomp extracted/sys          # storage from wii/nand/, see wii/README.md
+```
+
+The build makes two things: `wii-recomp`, the console, which is the same for every game, and `title.dylib` (`title.so` on Linux), the game's translated code, which the console loads from beside itself.
+
+To play from a disc image instead, pack the game and its native code into one file, and start the console with it. Or set up a console with the Wii Menu (see `docs/native_ios.md`) and put the image in its drive:
+
+```sh
+python3 recomp/tools/make_disc.py extracted game.wrd --native darwin-x86_64=recomp/build/title.dylib
+recomp/build/wii-recomp game.wrd
+python3 recomp/tools/prepare_console.py wii/nand console --menu recomp/build-menu
+cp game.wrd console/drive/ && recomp/build/wii-recomp --console console
+```
+
+A game built with `emit.py --virtual-bluetooth` reads the simulated Wii Remotes and Balance Board through its own Bluetooth code. Each remote has a Nunchuk plugged in unless the settings say otherwise. A game that sees a Classic Controller, such as Wii Fit Plus, may turn its pointer off and wait for Classic Controller buttons, so plug one in only for games played with it.
+
+### Controller settings
+
+The console keeps its controller settings in `controllers.ini`, in the console folder with `--console` and beside the program otherwise, or wherever `WII_RECOMP_CONTROLLERS` says. The first run writes it with every setting at its default, after a `#`. To change one, take the `#` away and edit it. A line with a mistake stops the console and names the line. It has these sections:
+
+- **`[remotes]`**: `mode`, as `WII_RECOMP_REMOTES` below. The environment variable wins when set.
+- **`[player1]` to `[player4]`**:
+  - `source`: what drives the player. It's a list of `keyboard`, `mouse`, `pad` (the next controller to connect), `pad:<serial number>` or `none`. Only one player can have the keyboard, or the mouse. Players with a keyboard or mouse are there from the start; the others join when their controller does.
+  - `attachment`: `none`, `nunchuk` or `classic`. `WII_RECOMP_ATTACHMENT` wins for player 1.
+  - `motionplus`: `yes` puts a Wii MotionPlus between the remote and its attachment, for games that use one. Games without MotionPlus find it switched off and carry on, and a controller's gyro gives its readings.
+  - `sideways`, `pointer`, `gyro_speed` and `recenter`: how a controller stands in for the remote.
+- **`[board]`**: `source = keyboard` or `none`, for the simulated Balance Board in games made for one.
+- **`[keys]`**: each keyboard control and up to four keys for it. The defaults are below.
+
+With no changes, player 1 is the keyboard and mouse, and the remote has a Nunchuk. Default keys: arrows for the D-pad, Enter for A, Backspace for B, `1`, `2`, `=` for plus, `-` for minus, `H` for Home. The arrows also tilt the Classic Controller's left stick and the Nunchuk's stick, X, C, Z and V are the Classic Controller's L, R, ZL and ZR (in Mario Kart Wii, L uses an item and R drifts), and C and Z are the Nunchuk's C and Z. Q shakes the remote. F2 plugs the next attachment into the remote: none, a Nunchuk, a Classic Controller. F3 plugs a Wii MotionPlus in or out. F11 or Alt+Enter switches full screen, where the mouse pointer hides. The remote tells the game, as when one is plugged in by hand. The mouse is the pointer. Space steps on or off the board, and W, A, S, D lean. A control pipe takes the same buttons by name, `l`, `r`, `zl`, `zr`, `c` and `z` among them, and `stick x y`.
+
+### Switch controllers and other gamepads
+
+Controllers are read through SDL3 (`runtime/pads.c`). A controller that connects joins the first player whose `source` takes one, a player named by its serial number first. That player's remote calls the game, as switching a remote on does, and leaves when the controller does. With the defaults, the first controller is player 1 alongside the keyboard, and the next ones are players 2 to 4.
+
+| The remote has | Controller | Wii |
+| --- | --- | --- |
+| A Nunchuk, or nothing | A, B / ZR, Y, X | A, B, 1, 2 |
+| | Left stick, L, ZL | Nunchuk stick, C, Z |
+| | R | A shake |
+| | D-pad, +, −, Home | the same |
+| A Classic Controller | Every button and both sticks where a Nintendo controller has them | the same |
+| Held sideways (`sideways = yes`, or one Joy-Con alone) | the D-pad or stick turned a quarter, B, A, X, Y | the D-pad, 1, 2, A, B |
+
+- **Pointer.** The gyro moves it. Turning 20 degrees from the middle reaches the side of the screen, or less with a higher `gyro_speed`. Turning left and right counts about whichever way is up, however the controller is held. `recenter` (the right stick's click by default) brings it back to the middle. `pointer = stick` moves it with the right stick instead.
+- **Motion and drift.** The controller's motion and turn are the remote's. A Joy-Con pair moves as two hands: the right one is the remote and the left one the Nunchuk. The gyro's zero is taken again whenever the controller is still for a second, so the pointer doesn't drift.
+- **Outputs.** The game's rumble rumbles the controller, the remote's lit light shows as its player light, and its battery shows in the game's Home Menu.
+- **Linux setup.** On Linux, run `sudo recomp/tools/remotes_setup.sh` once so SDL reads Switch controllers itself, with their gyro and rumble. The same setup is for real remotes, and both work together.
+- **Switch 2 controllers** work by cable only, as SDL 3.4 starts them over USB.
+- **Mac.** Pair controllers in System Settings.
+
+`WII_RECOMP_INPUT_STATS=1` prints, every five seconds for each controller:
+- how many gyro samples arrived a second
+- how often the remote read its player
+- how old the newest sample was when it did, at the middle and the 99th percentile
+- the gyro's zero
+
+The control pipe drives virtual controllers through SDL, so scripts and tests take the same path as real ones:
+- `pad add pro` or `pad add joycons` adds one, numbered from 1; `pad remove <n>` removes it.
+- `pad press|hold|release <n> <button>` works its buttons (`a`, `b`, `x`, `y`, `l`, `r`, `zl`, `zr`, `plus`, `minus`, `home`, `capture`, `left_stick`, `right_stick`, `dpad_up` and so on).
+- `pad stick <n> left|right x y` tilts a stick.
+- `pad accel <n> x y z` (in g) and `pad gyro <n> x y z` (degrees a second, SDL's axes) set its motion.
+- `pad turn <n> <right> <up>` turns it by that many degrees.
+
+### Real Wii Remotes and the Balance Board
+
+On the same `--virtual-bluetooth` builds, real remotes and a real board pass their reports straight to the game's own code, so the pointer, motion, attachments, rumble, the speaker and the board's sensors work with nothing simulated (`runtime/remote_link.c`). `WII_RECOMP_REMOTES` chooses:
+
+| Value | Devices |
+| --- | --- |
+| `auto` (default) | Real ones as they link. Until a real remote links, the simulated remote holds player 1, and the simulated board holds its slot until a real board links. |
+| `real` | Real ones only. |
+| `simulated` | The simulated ones only. |
+| `loopback` | The simulated ones, run behind the link on a thread of their own as though they were real. This tests the whole real-device path with no radio. |
+
+The board always takes the fifth slot, where games look for it. Each remote keeps its player number between runs, by address, in `remotes.txt` beside the program (in the console folder with `--console`). When a game hangs up on a remote, the remote turns off, and any button brings it back, as on a Wii. `WII_RECOMP_SPEAKER=off` keeps speaker sound from the remote and passes only its rumble.
+
+- **Raspberry Pi and other Linux:** run `sudo recomp/tools/remotes_setup.sh` once.
+  - bluetoothd takes a remote's connection as it does any controller's, and the console reads the remote through the kernel's HID (`runtime/remote_link_hidraw.c`). The setup keeps the kernel's own Wii Remote driver away, since it would send the remote reports of its own, and lets the console read Nintendo's controllers.
+  - Pair each remote and the board once with `sudo recomp/tools/remotes_setup.sh pair` after pressing its red SYNC button. From then on any button connects it.
+  - Without pairing, hold 1 and 2 as the game starts, or while the game searches for remotes.
+  - Remotes stay connected when the console hands over from the Wii Menu to a disc.
+  - A game hanging up can't turn a remote off this way, so it sleeps until a button is pressed.
+  - `--sockets` is the older way: bluetoothd's input plugin is turned off, the console answers remotes itself over raw sockets, and remotes do turn off. Wireless keyboards and Switch controllers stop working while it's set, and it must be run again after each build.
+  - `--undo` puts everything back.
+- **Mac:** pair the remote once in System Settings > Bluetooth while holding 1 and 2, and allow Input Monitoring if macOS asks. macOS can't turn a remote off, so when a game hangs up, the remote sleeps until a button is pressed.
+
+None of this has been tried with real hardware yet: the link, the Bluetooth chip's side and the Linux sockets are tested with stand-ins (`test/test_recomp_ios_rare.py`), and Wii Fit Plus plays through setup on `loopback`.
+
+Set `WII_RECOMP_CONTROL=<path>` to drive it from a script through a pipe at that path, one command per line: `press a`, `hold a`, `release a`, `pointer x y`, `stick x y` (the Classic Controller's left stick, -1 to 1), `board on <kg> <lean x> <lean y>`, `board off`, `accel x y z` (the remote's motion in g, along its own axes, x to its right: flat and still is `0 0 1`), `roll <degrees>` (turned clockwise and held still, which moves the camera's picture and gravity together, as games expect), `shake`, `nunchuk stick x y`, `nunchuk accel x y z`, and `attach none`, `attach nunchuk` or `attach classic`, `motionplus on` or `off`, and `gyro x y z` (how fast the remote turns, in degrees a second about its own axes, for a MotionPlus). Commands are player 1's unless they start with another player, as in `p2 press a`, and `p2 connect` and `p2 disconnect` bring a player's remote in and out, as switching a remote on and off does. Up to four players' remotes are there at once. The pipe also takes the console's own commands: `reset` presses its reset button, `shot <file>` saves the next picture (Vulkan only), `record <frames> <file>` records frames for `recomp/tools/replay`, and `dump` and `skip <first> <last>` are for the graphics inspector. Saves go to `recomp/build/saves`, or to `WII_RECOMP_SAVES`. On first start, files the Wii Menu makes on a new Wii and that neither folder has are made there, empty: WiiConnect24's settings, lists and mailboxes, and the Mii database. Games such as Mario Kart Wii stop at "Could not write to/read from Wii system memory" without them.
+
+Set `WII_RECOMP_MUTE=1` to skip the sound device, and `WII_RECOMP_AUDIO_WAV=<path>` to save what the mixer makes.
+
+Vulkan is the renderer everywhere it's built in. Set `WII_RECOMP_RENDERER=opengl` to use OpenGL instead, on a Mac or wherever Vulkan isn't working. With Vulkan, compiled shaders and pipelines are kept in `shader-cache` beside the program, and everything earlier runs used is built before the game starts. Each title also keeps the recipes for what it drew with, the keys its shaders are written from, as `shaders.bin` in its data folder; `add_game.py` packs them into the disc image, so a game's first run on another computer or console builds them all before the first picture, on every core. So a scene stutters only the first time any run of that game draws it. Delete the folder to start over, or set `WII_RECOMP_NO_SHADER_CACHE=1` to compare without it. On the Mac, pictures reach the window on a second queue, so a window that's slow to take them, as when macOS holds the window's pictures for up to a second, skips pictures instead of stopping the game; `WII_RECOMP_SHOW_IN_FRAME=1` shows them in the frame as before, and `WII_RECOMP_TEST_WINDOW_STALL=<n>` makes the n-th picture wait a second, to check. The game also tells macOS it's doing time-sensitive work, so a covered window doesn't slow it to 10 fps. `WII_RECOMP_IDLE_SPIN=1` makes the game's idle loop spin as it does on a Wii, for comparing against the normal sleep.
+
+The picture is drawn at twice the Wii's resolution, scaled to the window; `WII_RECOMP_SCALE` picks another, such as `5/2` for a sharper 1080p on a Pi whose game has room for it. A tile-based chip stores and reloads everything a pass covers, so `gx_vulkan.c` keeps passes few and small: clears become how a pass starts, a copy that comes out one flat value, such as a copy of a waiting clear, is a cached 1 by 1 image of it instead of a whole cleared one, work in the strip below the picture runs ahead of the frame, depth is copied as soon as the scene ends, depth a pass won't need isn't loaded or stored, a copy drawn straight back onto the picture it came from is skipped, and a translucent layer with nothing in it, which the game copies out, clears, puts back and lays over the picture up to four times a frame, is skipped whole. A layer with something in it is drawn into a second picture while the first stays put, so the picture isn't copied out and drawn back, and the layer's texture takes the second picture's image instead of a copy of it. Shaders write the second output that dual-source blending reads only when it differs from the first, as each one costs the chip another write of every pixel. Fog that a draw's vertex depths prove adds nothing isn't worked out for every pixel. A copy of depth that was just cleared whole is a fill, and a waiting clear of depth alone doesn't run as its own pass before a color copy. When a layer is given up after its picture copy was drawn back, that copy is left out as for a layer drawn apart, unless the draw at hand reads it, and a later read of it stops the skipping. On Linux, commands run on their own thread, except in games using FIFO breakpoints. A pass whose draws never touch depth runs with a scratch depth picture, so the real one stays in memory untouched, and a pass whose first draw covers all of it starts without loading the picture.
+
+For comparing, these turn each one off: `WII_RECOMP_DRAW_CLEARS=1`, `WII_RECOMP_NO_STRIP=1`, `WII_RECOMP_NO_EARLY_DEPTH=1`, `WII_RECOMP_KEEP_DEPTH=1`, `WII_RECOMP_KEEP_COPY_BACK=1`, `WII_RECOMP_KEEP_EMPTY_LAYERS=1`, `WII_RECOMP_NO_SIDE=1`, `WII_RECOMP_NO_SWAP=1`, `WII_RECOMP_KEEP_FOG=1`, `WII_RECOMP_NO_FLAT_DEPTH=1`, `WII_RECOMP_NO_FLAT_COPIES=1`, `WII_RECOMP_KEEP_DRAWN_BACK=1`, `WII_RECOMP_GX_INLINE=1`, `WII_RECOMP_DEPTH_EVERY_PASS=1`, `WII_RECOMP_NO_DRAW_REUSE=1`, `WII_RECOMP_NO_WATCH=1`. `WII_RECOMP_LIST_CACHE=1` keeps display lists' decoded vertices between calls, off by default as on the Pi it costs more than it saves. `WII_RECOMP_COVER=1` turns one on: when a page proven opaque covers the whole picture, the drawing before it is thrown away. It has been checked on one screen, so it stays off by default. `WII_RECOMP_GPU_TIMES=1` prints what the chip spent on each pass of one frame in every 300, or in every n with `=n`. `WII_RECOMP_TIMELINE=<first frame>:<frames>:<file>` writes what each thread did over those frames, interrupts, draw done, presenting and waits for the chip, as a trace for ui.perfetto.dev, for finding what waits on what.
+
+The graphics thread is through a frame in far less time than the Wii's chip, so it keeps pictures to the screen's pace: a new picture that comes less than a third of a field after the last, or once each field's allowance is used, waits for the next field, and a finished picture is shown a field after the one before. A game paced by its own chip rather than by the screen would otherwise run at hundreds of frames a second. `WII_RECOMP_FRAMES_UNHELD=1` lets every picture through, and `WII_RECOMP_SHOW_AT_ONCE=1` shows each as soon as it's finished.
+
+`recomp/tools/gap_report.py` merges `gaps.txt` files from any number of runs and titles into one table, most common first: `gap_report.py menu=recomp/build-menu/gaps.txt wiifit=recomp/build/gaps.txt`. It lists apart the rows marked done that a game still hit, and IDs with no row.
+
+### Automatic play
+
+`recomp/tools/autoplay/autoplay.py` plays a game by script and checks it got where it should, for testing any title without anyone at the keyboard. It drives the control pipe (buttons, the pointer, the Balance Board), saves the game's own pictures, and on a Mac reads the text on them with macOS's text recognition, so a session can click the button a screen names. It waits on the game's log, so nothing depends on the window.
+
+```sh
+python3 recomp/tools/autoplay/autoplay.py look                      # pictures every 5 s, no input
+python3 recomp/tools/autoplay/autoplay.py explore --keep runs/x     # reads each screen and presses on
+python3 recomp/tools/autoplay/autoplay.py setup --disc extracted/sys --saves <empty folder>
+```
+
+The game ID in the disc's `boot.bin` picks the session: first `autoplay/games/<game ID>/<session>.py`, then the shared `autoplay/sessions/`. The shared ones work for any game. A game's own folder holds what's particular to it: `games/RFPE01/setup.py` plays Wii Fit Plus's whole first-time setup, standing on the board when asked, and keeps the saves for later sessions to start from. To add a game, make its folder and build on `player.py`. Pictures and saves stay in `--keep` or a temporary folder, never in the repository. The exit status is 0 when the session passed.
+
+### Compatibility runs
+
+`recomp/tools/compat_run.py` plays every game you have for a while, one after another with nobody watching, and says how far each got and which gaps to close first.
+
+```sh
+python3 recomp/tools/compat_run.py all                          # every games/*.wrd, 90 s each
+python3 recomp/tools/compat_run.py RMCE01 ~/discs/game.rvz --seconds 120
+python3 recomp/tools/compat_run.py all --dry-run                # what it would build and play
+python3 recomp/tools/compat_run.py --report-from ~/wii-recomp-runs/mac ~/wii-recomp-runs/pi
+```
+
+A game can be a disc image, an extracted disc, a game ID added before or a `.wrd`. One without an image is built with `add_game.py` first. Each one is played by the same generic explorer as autoplay's `explore` session: it reads the screen, clicks the button it names or presses A, and tries something else on a screen that doesn't change. Nothing in it is about one game. It keeps the log, the gaps file and a picture every 10 s, and gives the game a tier from what it measured: doesn't boot, boots to first picture, reaches menus (pressing a button on a still screen led to a new one, twice), or in game (heavy drawing for 5 s after the menus). How the run ended is kept apart: ran the whole time, stopped, crashed, exited or stalled. The notes at the top of the tool say exactly how each is measured.
+
+It writes `report.md` and `report.json` in `~/wii-recomp-runs/compat-<date>/` unless `--out` says where, always outside the repository, as the pictures and logs are the game's. The report has each game's tier, frame rate and own gaps, then every gap across all games, scored by how many games hit it, how far those games got and how far its row in `docs/hardware_inventory.md` is from done, each linked to its row. That ranking is what the roadmap should follow.
+
+It never touches real saves: every game starts from a fresh copy of `recomp/build/saves` (or `--saves`, or `--saves empty` for a new Wii) inside its run folder. Remotes are simulated, and only the processes it started are ever stopped, by their process ID, at each game's time limit or when it's interrupted. Text recognition works on a Mac only; elsewhere screens are compared by picture alone. Where Vulkan doesn't start, it plays with OpenGL, whose pictures the control pipe's `shot` now saves too.
+
+`recomp/tools/import_nand.py` decrypts a BootMii NAND backup in `wii/` into the storage folder `wii/nand/` (see `wii/README.md`). Its file system and encryption follow Dolphin's `NANDImporter.cpp`.
+
+`recomp/tools/perf_run.py` measures a fixed run with no input from a copy of `recomp/build/saves`: frame rate, worst frame, CPU, the Mac's speed limit, and what each slow frame spent its time on. It works on a Mac only, because it reads `pmset`.
+
+`recomp/tools/replay/` plays a Dolphin FIFO recording through the runtime's graphics files with no game and no window, and saves each frame as a PNG. In Dolphin, with a game running: Tools > FIFO Player, set Frames to Record, press Record, wait for it to finish, then Save.... Recordings hold the game's textures and models, so `*.dff` stays out of the repo. Only file version 6 is read, which is what Dolphin writes now.
+
+```sh
+make -C recomp/tools/replay VULKAN_SDK=$PWD/recomp/build/vulkan-sdk
+recomp/tools/replay/build/replay scene.dff recomp/build/frames [--frames <count>]
+python3 recomp/tools/compare_frames.py <folder a> <folder b> --out <folder for difference pictures>
+```
+
+Each frame of the recording gives one PNG, of its last copy to the screen. A frame with none repeats the last picture, as a TV would. Frames are at the picture's scale, 2 by default; set `WII_RECOMP_SCALE=1` for the Wii's own size, or pass `--resize` to `compare_frames.py`. The `WII_RECOMP_*` switches above work here too.
+
+- `translate/decode.py` names each instruction.
+- `translate/functions.py` finds the functions.
+- `translate/modules.py` reads the modules a program loads at run time, the Wii Menu's RSOs and the REL modules most games keep the bulk of their code in, and prepares their code for translation wherever they end up loaded. `emit.py` translates every module it finds in `sys/modules` and in the disc's files, and `runtime/modules.c` checks each one, once the game links it, against what was translated. Modules in a folder named `rel`, `rels`, `module` or `modules` are found whatever their file names, and LH-compressed ones (type 0x40) are read too. A call from one REL into another reads its target from the branch the game's linker wrote, each time, as that linker relinks modules when they come and go, and a module loaded over another lets the old one's functions go. `WII_RECOMP_NO_MODULES=all` leaves every module to the interpreter, or a list of names those, to tell a module's own faults from its translation's.
+- `translate/emit.py` writes the C. Its `REPLACED` list holds system functions we skip on purpose, and `IDLE_LOOPS` holds waits that sleep instead of spinning.
+- `runtime/` holds the native side:
+  - `main.c`, `loader.c`: start-up and loading the game.
+  - `title.c`: loading a title's native code, and checking it belongs to this console and this program.
+  - `console.c`: the console folder, and handing over between the Wii Menu and the disc.
+  - `drive.c`, `dvd.c`: what's in the drive, and the drive as programs see it. `apploader.c` runs a disc's apploader as its native code.
+  - `dispatch.c`, `interp.c`: indirect calls, and an interpreter for any address with no translated code, such as a module loaded at run time. `dispatch` logs each such address once. `test/test_recomp_differential.py` runs every instruction both ways and compares the results. Run it directly to list any disagreements.
+  - `guest_memory.h`, `guest_memory.c`: the Wii's memory, one window at a fixed host address. A load or store is a mask, one compare that sends the hardware block to `hardware.c`, and the access, and an access through the stack pointer skips the compare. Where a Wii has no memory, the first touch opens a zero page and is named in `gaps.txt` as `cpu.dsi_isi`. A real crash prints the faulting address and function first.
+  - `threads.c`, `interrupts.c`: the game's threads, interrupts and clocks.
+  - `hardware.c`: hardware registers.
+  - `pads.c`: host controllers through SDL3, and `pad_map.c`, how one stands in for a Wii Remote, with the gyro pointer.
+  - `input.c`: the four players' controls and the board's weight, set by the keyboard, mouse and control pipe. `control_pipe.c` reads the pipe, and `input_direct.c` stands in for the game's own remote functions in builds without `--virtual-bluetooth`. `controllers.c` reads `controllers.ini` with `settings_file.c`, a small INI reader.
+  - `bluetooth.c`, `bluetooth_channels.c`, `wii_remote.c`: the virtual Bluetooth chip and each slot's device. `remote_link.c` links real devices into the slots, through `remote_link_linux.c` or `remote_link_mac.c`, or `remote_link_loopback.c` for testing.
+  - `dsp.c`, `ax.c`, `ax_voice.h`, `zelda.c`, `dsp_lle*.c`, `dsp_accelerator.c`, `dsp_record.c`: the audio processor. `dsp.c` has its mailboxes and identifies the game's program by a checksum; `ax.c` (GameCube and Wii AX) and `zelda.c` are C versions of the known programs, and the interpreter in `dsp_lle*.c` runs any other. `dsp_record.c` records the interpreter's work for `tools/sound_bench.py`, which checks the C versions against it.
+  - `audio.c`, `audio_output_mac.c`: sound. The audio DMA reads what the program wrote to memory, `audio.c` hands it to the output thread, and the output file is the only per-platform part.
+  - `ios.c`, `devices.c`, `es.c`, `files.c`, `fs.c`: stand-ins for the Wii's system services and storage.
+  - `gx_fifo.c`, `gx_vertex.c`, `gx_transform.c`, `gx_light.c`, `gx_texture.c`, `gx_tev.c`, `gx_shader.c`, `gx_copy.c`, `gx_draw.c`, `window.c`: graphics, from command stream to window. The vertex and color stages become small shaders written for each setup the game uses, cached by key in `gx_shader.c`.
+  - `dff.c`: reads Dolphin's FIFO recordings, for `tools/replay`. With `REPLAY_DUMP=<frame>`, the replay tool writes that frame's draws to the file `WII_RECOMP_GX_INSPECT` names, and `REPLAY_SKIP=<first>-<last>` leaves a range of each frame's draws out, as the control pipe's `dump` and `skip` do in a game.
+  - `debug.c`: set `WII_RECOMP_ACTIVITY=1` for per-second counts and a line for each frame over 20 ms, or `WII_RECOMP_DUMP_AFTER=<seconds>` to list what each thread is waiting for. `WII_RECOMP_FPS_LOG=1` prints the frames shown in each second, and `WII_RECOMP_DISC_LOG=1` prints where on the disc each read lands and its size, to match against the disc's file table and see what a game loads. `WII_RECOMP_FRAME_LOG=1` prints each frame's time and each picture's arrival in the window; 2 adds how long the game's thread sat idle in the frame, and 3 which of the game's threads was current. On Linux, `WII_RECOMP_SLOW_SAMPLES=1` samples the game's thread ten thousand times a second and follows each slow frame's line with where its time went; `=all` also totals every frame's samples, and `=graphics` samples the graphics thread instead. The control pipe's `threads` lists the game's threads, and where each one is, at once. Building with `WII_RECOMP_EMIT_TRACE=<address>,<address>` makes those functions log each call as the game runs, from the count in `WII_RECOMP_TRACE_FROM` on.
+  - `gaps.c`: every time a game asks for something we don't do, it's logged once as `gap: <id>`, where the ID is its row in `docs/hardware_inventory.md`. The list goes to `gaps.txt` beside the program (`cache/gaps.txt` in a console folder), or to `WII_RECOMP_GAPS`. `WII_RECOMP_GAPS_STRICT=1` stops at the first one, with exit code 12.
+  - `gx_recipes.c`: the shader recipes each title has drawn with, kept in its data folder and carried in its disc image, and built before the first picture.
+  - `profile.c`: what each title's code did, kept in its own folder under `title-data/` beside the program (`cache/titles/` in a console folder, or `WII_RECOMP_TITLE_DATA`): `profile.txt`, how often each function built to count has run over every run, and `discovered.txt`, code the interpreter had to run. `add_game.py` hands both to the next build.

@@ -1,0 +1,378 @@
+// The guest processor and memory, shared by the translated game and the runtime.
+#pragma once
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "guest_memory.h"
+
+typedef struct {
+  uint32_t r[32];
+  double f[32];   // Paired singles: first value.
+  double p[32];   // Paired singles: second value.
+  uint8_t cr[8];  // Each field: 8 less, 4 greater, 2 equal, 1 summary overflow.
+  uint32_t lr, ctr, ca, so, msr, fpscr;
+  uint32_t spr[1024];
+  uint32_t ov, xer_string;  // XER's overflow bit, and its byte count and compare fields.
+  uint32_t sr[16];          // Segment registers. Stored only, as nothing maps through them.
+} Cpu;
+
+#ifdef _WIN32
+#define cpu (*(Cpu *)HOST_STATE_ADDRESS)
+#else
+extern Cpu cpu;
+#endif
+
+typedef void (*GuestFunction)(void);
+void dispatch(uint32_t address);
+GuestFunction translated_at(uint32_t address);  // 0 if nothing is translated there.
+void unimplemented(uint32_t address, const char *name);
+void guest_panic(void);
+void input_read(void);
+void input_probe(void);
+void input_board_sensors(void);
+void input_board_calibration(void);
+void input_board_weights(void);
+void guest_fatal(void);
+void system_call(uint32_t address);
+void trap_taken(uint32_t address);  // A tw or twi whose condition held: processor.c.
+void fpscr_mode_changed(uint32_t fpscr);  // Applies the rounding and non-IEEE modes: processor.c.
+void floating_point_exceptions_check(void);  // Reports a game turning on floating-point exceptions: processor.c.
+uint32_t hw_read(uint32_t address, int bytes);
+void hw_write(uint32_t address, uint32_t value, int bytes);
+uint64_t time_base(void);        // The runtime's own clock, which deadlines use.
+uint64_t guest_time_base(void);  // What the game reads. It can set this one.
+void guest_time_base_set(int high_half, uint32_t value);
+void time_start(void);
+uint64_t wii_ticks_at(int64_t unix_seconds, long utc_offset_seconds);
+void ps_load(uint32_t address, int w, int gqr, int rd);
+void ps_store(uint32_t address, int w, int gqr, int rs);
+
+// Threads (threads.c): the game's context functions, replaced at translation.
+void save_context(void);
+void load_context(void);
+void enter_exception(uint32_t kind, uint32_t handler);
+// The game's setjmp and longjmp, as host context switches (threads.c).
+void guest_setjmp(void);
+void guest_longjmp(void);
+void guest_setjmp_plain(void);   // The same without paired singles (Mario Party 8).
+void guest_longjmp_plain(void);
+
+// Interrupts (interrupts.c). Translated code counts down and checks in here.
+#ifdef _WIN32
+#define interrupt_budget (*(int *)(HOST_STATE_ADDRESS + 0x8000))
+#else
+extern int interrupt_budget;
+#endif
+void poll_interrupts(void);
+// The program turned external interrupts on (mtmsr). One already waiting is taken at the
+// next check, as the processor takes it at once, rather than when the count runs out:
+// a program that turns them on only for a moment would otherwise almost never see one.
+void interrupts_turned_on(void);
+void decrementer_set(uint32_t value);
+uint32_t decrementer_get(void);
+void locked_cache_transfer(void);
+// Writing WPAR resets the CPU's write-gather pipe, dropping bytes it hadn't sent, as
+// Dolphin's GPFifo does (gx_fifo.c). GXBeginDisplayList relies on it.
+void graphics_pipe_reset(void);
+#define POLL() do { if (--interrupt_budget < 0) poll_interrupts(); } while (0)
+
+// Memory is one window at a fixed address (guest_memory.h). An access costs a mask, one
+// compare that sends the hardware registers to hw_read and hw_write, and the access
+// itself: no pointer to load and no range to look up. The hardware block is masked
+// 0x08000000 to 0x0fffffff, which also holds the picture memory at 0xc8000000.
+static inline int is_hardware(uint32_t address) { return (address & 0x38000000u) == 0x08000000u; }
+static inline uint8_t *flat(uint32_t address) { return GUEST_BASE + (address & 0x3fffffffu); }
+
+// A pointer for runtime code that copies whole blocks (DMA, the disc, graphics), or 0
+// where there's no memory to point at.
+static inline uint8_t *host(uint32_t address) {
+  uint32_t physical = address & 0x3fffffff;
+  if (physical < MEM1_SIZE || physical - MEM2_START < MEM2_SIZE || physical - LOCKED_CACHE_PHYSICAL < LOCKED_CACHE_SIZE) {
+    return GUEST_BASE + physical;
+  }
+  return 0;
+}
+
+#define GUEST_LOAD(bits, swap)                                  \
+  static inline uint32_t rd##bits(uint32_t a) {                 \
+    if (__builtin_expect(is_hardware(a), 0)) return hw_read(a, bits / 8); \
+    uint##bits##_t v;                                           \
+    memcpy(&v, flat(a), bits / 8);                              \
+    return swap(v);                                             \
+  }                                                             \
+  /* The stack is always memory, so r1's accesses skip the check (emit.py). */ \
+  static inline uint32_t rd##bits##s(uint32_t a) {              \
+    uint##bits##_t v;                                           \
+    memcpy(&v, flat(a), bits / 8);                              \
+    return swap(v);                                             \
+  }
+#define GUEST_STORE(bits, swap)                                 \
+  static inline void wr##bits(uint32_t a, uint32_t v) {         \
+    if (__builtin_expect(is_hardware(a), 0)) { hw_write(a, v & (uint32_t)(uint##bits##_t)~0u, bits / 8); return; } \
+    uint##bits##_t s = swap((uint##bits##_t)v);                 \
+    memcpy(flat(a), &s, bits / 8);                              \
+  }                                                             \
+  static inline void wr##bits##s(uint32_t a, uint32_t v) {      \
+    uint##bits##_t s = swap((uint##bits##_t)v);                 \
+    memcpy(flat(a), &s, bits / 8);                              \
+  }
+#define NO_SWAP(v) (v)
+GUEST_LOAD(8, NO_SWAP)
+GUEST_LOAD(16, __builtin_bswap16)
+GUEST_LOAD(32, __builtin_bswap32)
+GUEST_STORE(8, NO_SWAP)
+GUEST_STORE(16, __builtin_bswap16)
+GUEST_STORE(32, __builtin_bswap32)
+
+static inline uint64_t rd64(uint32_t a) {
+  if (__builtin_expect(is_hardware(a), 0)) return ((uint64_t)hw_read(a, 4) << 32) | hw_read(a + 4, 4);
+  uint64_t v;
+  memcpy(&v, flat(a), 8);
+  return __builtin_bswap64(v);
+}
+static inline uint64_t rd64s(uint32_t a) {
+  uint64_t v;
+  memcpy(&v, flat(a), 8);
+  return __builtin_bswap64(v);
+}
+static inline void wr64(uint32_t a, uint64_t v) {
+  if (__builtin_expect(is_hardware(a), 0)) {
+    hw_write(a, (uint32_t)(v >> 32), 4);
+    hw_write(a + 4, (uint32_t)v, 4);
+    return;
+  }
+  uint64_t s = __builtin_bswap64(v);
+  memcpy(flat(a), &s, 8);
+}
+static inline void wr64s(uint32_t a, uint64_t v) {
+  uint64_t s = __builtin_bswap64(v);
+  memcpy(flat(a), &s, 8);
+}
+
+static inline float as_float(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
+static inline uint32_t float_bits(float f) { uint32_t v; memcpy(&v, &f, 4); return v; }
+static inline double as_double(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
+static inline uint64_t double_bits(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
+
+static inline uint8_t cr_compare(int32_t a, int32_t b) {
+  return (a < b ? 8 : a > b ? 4 : 2) | (uint8_t)cpu.so;
+}
+static inline uint8_t cr_compare_unsigned(uint32_t a, uint32_t b) {
+  return (a < b ? 8 : a > b ? 4 : 2) | (uint8_t)cpu.so;
+}
+static inline uint8_t cr_float(double a, double b) {
+  return a < b ? 8 : a > b ? 4 : a == b ? 2 : 1;
+}
+static inline int cr_bit(int bit) { return (cpu.cr[bit >> 2] >> (3 - (bit & 3))) & 1; }
+static inline void cr_set(int bit, int value) {
+  uint8_t mask = (uint8_t)(1 << (3 - (bit & 3)));
+  cpu.cr[bit >> 2] = (uint8_t)((cpu.cr[bit >> 2] & ~mask) | (value ? mask : 0));
+}
+static inline uint32_t rotl(uint32_t v, int n) { n &= 31; return n ? (v << n) | (v >> (32 - n)) : v; }
+static inline uint32_t mask(int mb, int me) {
+  uint32_t a = 0xffffffffu >> mb, b = me == 31 ? 0xffffffffu : ~(0xffffffffu >> (me + 1));
+  return mb <= me ? a & b : a | b;
+}
+static inline uint32_t add_carry(uint32_t a, uint32_t b, uint32_t in) {
+  uint64_t sum = (uint64_t)a + b + in;
+  cpu.ca = (uint32_t)(sum >> 32);
+  return (uint32_t)sum;
+}
+static inline int32_t to_int(double v) {
+  if (!(v == v)) return INT32_MIN;
+  if (v >= 2147483647.0) return INT32_MAX;
+  if (v <= -2147483648.0) return INT32_MIN;
+  return (int32_t)v;
+}
+
+// XER is kept in pieces, as carry and summary overflow are read far more than the whole.
+// Which bits exist is from Dolphin's UReg_XER (Gekko.h).
+#define XER_STRING_BITS 0xff7fu
+static inline uint32_t xer_get(void) { return cpu.so << 31 | cpu.ov << 30 | cpu.ca << 29 | cpu.xer_string; }
+static inline void xer_set(uint32_t v) {
+  cpu.so = v >> 31;
+  cpu.ov = (v >> 30) & 1;
+  cpu.ca = (v >> 29) & 1;
+  cpu.xer_string = v & XER_STRING_BITS;
+}
+static inline void set_overflow(int overflowed) {
+  cpu.ov = (uint32_t)overflowed;
+  cpu.so |= (uint32_t)overflowed;
+}
+static inline uint32_t add_overflow(uint32_t a, uint32_t b, uint32_t in) {
+  uint32_t sum = a + b + in;
+  set_overflow((int)(((a ^ sum) & (b ^ sum)) >> 31));
+  return sum;
+}
+static inline uint32_t add_carry_overflow(uint32_t a, uint32_t b, uint32_t in) {
+  uint32_t sum = add_overflow(a, b, in);
+  cpu.ca = (uint32_t)(((uint64_t)a + b + in) >> 32);
+  return sum;
+}
+static inline uint32_t multiply_overflow(uint32_t a, uint32_t b) {
+  int64_t product = (int64_t)(int32_t)a * (int32_t)b;
+  set_overflow(product != (int32_t)product);
+  return (uint32_t)product;
+}
+static inline int divide_overflows(uint32_t a, uint32_t b) { return !b || (a == 0x80000000u && b == 0xffffffffu); }
+// Dolphin's results for a quotient that doesn't exist (Interpreter_Integer.cpp).
+static inline uint32_t divide_signed(uint32_t a, uint32_t b) {
+  if (divide_overflows(a, b)) return (int32_t)a < 0 ? 0xffffffffu : 0;
+  return (uint32_t)((int32_t)a / (int32_t)b);
+}
+static inline uint32_t divide_signed_overflow(uint32_t a, uint32_t b) {
+  set_overflow(divide_overflows(a, b));
+  return divide_signed(a, b);
+}
+static inline uint32_t divide_unsigned_overflow(uint32_t a, uint32_t b) {
+  set_overflow(!b);
+  return b ? a / b : 0;
+}
+
+// FPSCR. Status from arithmetic isn't computed, but what the game writes behaves. The
+// bit groups and the FX, VX and FEX rules are Dolphin's: Gekko.h, Interpreter_FPUtils.h
+// (SetFPException, UpdateFPExceptionSummary) and Interpreter_SystemRegisters.cpp.
+#define FPSCR_RESERVED 0x00000800u
+#define FPSCR_FX 0x80000000u
+#define FPSCR_FEX 0x40000000u
+#define FPSCR_VX 0x20000000u
+#define FPSCR_INVALID_BITS 0x01f80700u  // VXSNAN to VXVC, VXSOFT to VXCVI.
+#define FPSCR_EXCEPTION_BITS (0x1e000000u | FPSCR_INVALID_BITS)  // OX, UX, ZX, XX and the above.
+#define FPSCR_ENABLE_BITS 0x000000f8u
+#define FPSCR_ROUNDING 3u
+#define FPSCR_NON_IEEE 4u
+static inline void fpscr_write(uint32_t value) {
+  value &= ~(uint32_t)FPSCR_RESERVED;
+  value = (value & FPSCR_INVALID_BITS) ? value | FPSCR_VX : value & ~FPSCR_VX;
+  uint32_t modes_before = cpu.fpscr & (FPSCR_ROUNDING | FPSCR_NON_IEEE);
+  cpu.fpscr = (value >> 22) & value & FPSCR_ENABLE_BITS ? value | FPSCR_FEX : value & ~FPSCR_FEX;
+  if (__builtin_expect((cpu.fpscr & (FPSCR_ROUNDING | FPSCR_NON_IEEE)) != modes_before, 0)) fpscr_mode_changed(cpu.fpscr);
+}
+// Setting an exception bit that was clear also sets FX.
+static inline void fpscr_set_bit(int bit) {
+  uint32_t mask = 0x80000000u >> bit;
+  fpscr_write(cpu.fpscr | mask | (mask & FPSCR_EXCEPTION_BITS & ~cpu.fpscr ? FPSCR_FX : 0));
+}
+static inline void fpscr_clear_bit(int bit) { fpscr_write(cpu.fpscr & ~(0x80000000u >> bit)); }
+static inline void fpscr_write_field(int field, uint32_t value) {
+  int shift = 28 - field * 4;
+  fpscr_write((cpu.fpscr & ~(15u << shift)) | value << shift);
+}
+static inline void fpscr_write_fields(uint32_t fields, uint32_t value) {
+  uint32_t bits = 0;
+  for (int i = 0; i < 8; i++) if (fields & (1u << i)) bits |= 15u << (i * 4);
+  fpscr_write((cpu.fpscr & ~bits) | (value & bits));
+}
+// Reading a field into CR clears any exception bits it held.
+static inline uint32_t fpscr_take_field(int field) {
+  int shift = 28 - field * 4;
+  uint32_t value = (cpu.fpscr >> shift) & 15;
+  fpscr_write(cpu.fpscr & ~((15u << shift) & (FPSCR_FX | FPSCR_EXCEPTION_BITS)));
+  return value;
+}
+#define FLOAT_RESULT_MARK 0xfff8000000000000ull  // Hardware's top bits on an integer result.
+static inline double fpscr_as_double(void) { return as_double(FLOAT_RESULT_MARK | cpu.fpscr); }
+
+// fctiw and fctiwz. The top word is what Dolphin measured on hardware
+// (Interpreter_FloatingPoint.cpp, ConvertToInteger). Only stfd can see it. Hardware also
+// marks a zero result from a negative input there. That isn't copied: fctiwz is common,
+// and the mark cost more than the conversion's other work put together.
+#define ROUND_NEAREST 0
+#define ROUND_TOWARD_ZERO 1
+#define ROUND_UP 2
+#define ROUND_DOWN 3
+static inline double float_to_int(double v, uint32_t rounding) {
+  int32_t value;
+  switch (rounding) {
+    case ROUND_NEAREST: value = to_int(rint(v)); break;
+    case ROUND_UP: value = to_int(ceil(v)); break;
+    case ROUND_DOWN: value = to_int(floor(v)); break;
+    default: value = to_int(v); break;
+  }
+  return as_double(FLOAT_RESULT_MARK | (uint32_t)value);
+}
+
+// The processor moves a float into a register by rearranging its bits. A C cast does
+// the same, except that it quiets a signaling NaN, which is any data with an exponent
+// of all ones and the top fraction bit clear: the color ff a0 40 ff, say.
+static inline double single_to_double(uint32_t v) {
+  if (__builtin_expect((v & 0x7f800000u) == 0x7f800000u, 0)) {
+    return as_double((uint64_t)(v & 0x80000000u) << 32 | 0x7ff0000000000000ull | (uint64_t)(v & 0x007fffffu) << 29);
+  }
+  return (double)as_float(v);
+}
+
+// Storing a NaN rearranges its bits, as loading does. Anything else goes through a cast,
+// which is far quicker here than rearranging, and stfs is common. The cast rounds where
+// hardware truncates (Dolphin's ConvertToSingle, Interpreter_FPUtils.h), and gives
+// infinity for a double too big for a float. Both need a value no one rounded to single.
+#define DOUBLE_SIGN 0x8000000000000000ull
+static inline uint32_t double_top_bits(uint64_t x) { return (uint32_t)((x >> 32) & 0xc0000000u) | (uint32_t)((x >> 29) & 0x3fffffffu); }
+static inline uint32_t double_to_single(double d) {
+  if (__builtin_expect(d != d, 0)) return double_top_bits(double_bits(d));
+  return float_bits((float)d);
+}
+// psq_st also flushes denormals, unlike stfs (ConvertToSingleFTZ, the same file).
+static inline uint32_t double_to_single_flushed(double d) {
+  uint32_t bits = double_to_single(d);
+  return bits & 0x7f800000u ? bits : bits & 0x80000000u;
+}
+
+// Paired-single loads and stores (psq_l, psq_st and their forms), which convert by the
+// type and scale in a GQR register. Inline, as games run them for every value of a
+// matrix, vertex or movie frame: with W and the register known where it's translated,
+// what's left is a test of the GQR's type. quantized.c wraps these for the interpreter.
+static inline double ps_power_of_two(int exponent) { return as_double((uint64_t)(1023 + exponent) << 52); }
+static inline int ps_scale(uint32_t six_bits) { return six_bits & 32 ? (int)six_bits - 64 : (int)six_bits; }
+
+static inline double ps_load_one(uint32_t address, int type, double factor) {
+  switch (type) {
+    case 4: return (double)(uint8_t)rd8(address) * factor;
+    case 5: return (double)(uint16_t)rd16(address) * factor;
+    case 6: return (double)(int8_t)rd8(address) * factor;
+    case 7: return (double)(int16_t)rd16(address) * factor;
+    default: return single_to_double(rd32(address));
+  }
+}
+
+static inline void ps_store_one(uint32_t address, int type, double factor, double value) {
+  double scaled = value * factor;
+  switch (type) {
+    case 4: wr8(address, scaled <= 0 ? 0 : scaled >= 255 ? 255 : (uint32_t)scaled); break;
+    case 5: wr16(address, scaled <= 0 ? 0 : scaled >= 65535 ? 65535 : (uint32_t)scaled); break;
+    case 6: wr8(address, (uint32_t)(scaled <= -128 ? -128 : scaled >= 127 ? 127 : (int32_t)scaled)); break;
+    case 7: wr16(address, (uint32_t)(scaled <= -32768 ? -32768 : scaled >= 32767 ? 32767 : (int32_t)scaled)); break;
+    default: wr32(address, double_to_single_flushed(value)); break;
+  }
+}
+
+static inline int ps_bytes(int type) { return type == 4 || type == 6 ? 1 : type == 5 || type == 7 ? 2 : 4; }
+
+static inline void ps_load_inline(uint32_t address, int w, int gqr, int rd) {
+  uint32_t q = cpu.spr[912 + gqr];
+  int type = (q >> 16) & 7;
+  if (__builtin_expect(type < 4, 1)) {  // Floats, the usual case: no scaling.
+    double first = single_to_double(rd32(address));
+    cpu.p[rd] = w ? 1.0 : single_to_double(rd32(address + 4));
+    cpu.f[rd] = first;
+    return;
+  }
+  double factor = ps_power_of_two(-ps_scale((q >> 24) & 63));
+  double first = ps_load_one(address, type, factor);
+  cpu.p[rd] = w ? 1.0 : ps_load_one(address + (uint32_t)ps_bytes(type), type, factor);
+  cpu.f[rd] = first;
+}
+
+static inline void ps_store_inline(uint32_t address, int w, int gqr, int rs) {
+  uint32_t q = cpu.spr[912 + gqr];
+  int type = q & 7;
+  if (__builtin_expect(type < 4, 1)) {
+    wr32(address, double_to_single_flushed(cpu.f[rs]));
+    if (!w) wr32(address + 4, double_to_single_flushed(cpu.p[rs]));
+    return;
+  }
+  double factor = ps_power_of_two(ps_scale((q >> 8) & 63));
+  ps_store_one(address, type, factor, cpu.f[rs]);
+  if (!w) ps_store_one(address + (uint32_t)ps_bytes(type), type, factor, cpu.p[rs]);
+}
