@@ -1,6 +1,6 @@
 <h1 align="center">SeaOfStar-ToD</h1>
 
-<p align="center"><em>Rune Factory: Tides of Destiny (Wii), running natively on Windows x64 without an emulator.</em></p>
+<p align="center"><em>Rune Factory: Tides of Destiny (Wii), running natively on Windows x64 (and, experimentally, Android arm64) without an emulator.</em></p>
 
 SeaOfStar-ToD is a static recompilation project. The game's PowerPC code is translated to C
 ahead of time and compiled into a normal Windows program; the Wii's operating system, IOS,
@@ -12,7 +12,7 @@ emulator and not a decompilation: the game's own asset loaders still run on the 
 
 ## Status
 
-Playable baseline. Tested with the USA disc
+Playable baseline on Windows, experimental on Android (see [Android](#android-experimental)). Tested with the USA disc
 `SO3EE9`; details and evidence in [docs/08-progress.md](docs/08-progress.md).
 
 Working (measured):
@@ -23,8 +23,9 @@ Working (measured):
   confirmed loading into gameplay.
 - **Frame rate:** a 30 fps lock. In launcher play from the packed image the median frame is
   33.3 ms (p95 34.5 ms), with about 7 frames over 50 ms per minute.
-- **Shader pre-bake:** the packed image carries 341 shader recipes collected by playing, so
-  scenes draw without compiling shaders.
+- **Shader pre-bake:** the packed image carries 617 shader recipes (373 from manual play,
+  grown by map, season/time/weather, festival-date and dungeon-battle sweeps), so scenes draw
+  without compiling shaders; fresh-cache verification shows 0-4 misses per route.
 - **Upscaling:** real FSR 1.0 (EASU + RCAS) inside the runtime's Vulkan present path.
 - **Launcher:** native Win32 window with Home, Settings, Game files and Build pages, a
   remappable controls editor, a crash report and an FPS overlay switch.
@@ -87,6 +88,43 @@ The launcher's built-in default paths point at the maintainer's development clon
 `runtime\games\SO3EE9.wrd` (disc at its original offsets, native library, shader
 recipes). Commands and options: [docs/04-tooling.md](docs/04-tooling.md).
 
+## Android (experimental)
+
+An Android arm64-v8a build of the same runtime and the same generated code. Nothing is
+distributed: you build the native libraries and the image on your PC from your own dump and
+push them to your phone. iOS is planned later via a cloud build (Codemagic); it has not been
+started. Decisions: ADR-016 to ADR-018 in [docs/07-decisions.md](docs/07-decisions.md); plan and
+milestones: [docs/android-port-plan.md](docs/android-port-plan.md).
+
+Proven (2026-11-26, Samsung Galaxy M33 5G, Exynos 1280, Mali-G68, measured with the runtime's own
+frame summary):
+
+- Boots to gameplay from the packed image; a late save slot loads.
+- 30 fps lock: indoors median 33.2-33.5 ms (p95 about 36 ms); in town 33.3-33.5 ms with no frame
+  over 50 ms per 10 s after warm-up. Also with the CPU capped at 1.54 GHz and the GPU at 611 MHz
+  (town median 33.3-33.4 ms, p95 35.8-37.9 ms; it was 50 ms before the alpha-pass change, ADR-017).
+- Shader recipes: the 617 recipes of the image compile on the device in about 10-12.6 s.
+- Touch controls with a layout editor, and a launcher with settings including an FPS overlay and FSR.
+
+Not proven: a physical controller on the device (supported through SDL3 and the same mapping
+code as on PC, but untested on the phone), sessions longer than 15 minutes and their thermal
+behaviour, other phones, PAL and Japanese discs, and iOS. The build is a debug APK installed
+with adb; there is no release build, signing or in-app builder yet.
+
+Build (Windows PC; the translated sources come from `tools\wii-recomp-build.ps1`):
+
+- Requirements: the Android SDK with NDK r27.2 (`ANDROID_HOME`), CMake 3.22.1 and Ninja from the
+  SDK, a JDK 17 to 21 for Gradle, Python 3, `adb`, SDL3 (the script downloads and builds the
+  3.4.20 release; its output goes to `work\android-deps`, or `SEAOFSTAR_ANDROID_DEPS`) and your own
+  dump.
+- `tools\android-build.ps1` builds `libwiirecomp.so` and `libtitle.so`; then
+  `tools\android-push.ps1` builds the APK, replaces the image's native code with the Android
+  library, installs it and pushes the image (about 2.4 GB) and a first set of saves.
+  `tools\android-push.ps1 -DryRun` prints every step without touching anything; each script's header lists its switches.
+- App icon and label from your own disc are generated locally by `tools\android-branding.py`
+  and never tracked; without a dump the APK has a neutral icon and the label SeaOfStar-ToD.
+- Everything pushed to the phone is game-derived and stays local.
+
 ## Controls
 
 Keyboard, mouse and gamepad work at once, with defaults that need no setup (WASD, Enter,
@@ -98,6 +136,7 @@ Backspace, mouse pointer). Everything is remappable in the launcher. See
 | Path | Purpose |
 |---|---|
 | `launcher/` | The native Win32 launcher (`SeaOfStar-ToD.exe`) |
+| `android/` | The Android app shell (Gradle project, Java launcher and touch overlay, SDL3 Java glue); native libraries and branding come from your own build and are never tracked |
 | `tools/` | PowerShell and Python entry points: environment check, extraction, build, packing, playtests, save import |
 | `config/` | Local settings; `*.example.*` files are tracked, the rest is local |
 | `docs/` | Documentation index in [docs/README.md](docs/README.md) |

@@ -222,6 +222,34 @@ Goal 4 (recipe coverage). Facts first, hypotheses marked. Run folders are under 
 
 **Next:** more content (other monsters, spells, weapons, cutscenes, menus); saturation criterion unchanged (a full sweep under new conditions adds 0 recipes).
 
+## Android port, Galaxy M33 5G (2026-11-26)
+
+Samsung Galaxy M33 5G (Exynos 1280, Mali-G68 MP4), arm64-v8a, from the user's own dump (ADR-016 to
+ADR-018, `docs/android-port-plan.md`). Measured on the device with the runtime's own frame summary
+(`frames: n, median, p95, max, over 50 ms`, every 10 s):
+
+Proven:
+
+- Boots to gameplay from the packed image with the android-arm64 title library; a late save slot loads.
+- Indoors (room): median 33.2-33.5 ms, p95 about 36 ms, 0 frames over 50 ms.
+- Town, cold start: median 33.3-33.5 ms.
+- Town, throttled (CPU capped at 1.54 GHz, GPU 611 MHz): median 50 ms with the earlier alpha rule; after
+  the alpha-pass change (ADR-017) 33.3-33.4 ms, p95 35.8-37.9 ms, 0 frames over 50 ms per 10 s after warm-up.
+- Draws per frame in town: 7311 with 6733 second alpha passes before; 6733 with none after. Pipeline binds
+  per frame 13506 before, 215 after.
+- The SDL UI thread busy-poll is fixed: it was 34% of the profile samples, below 1% now (ADR-018).
+- Shader pre-bake: 617 recipes compile on the device in about 10-12.6 s.
+- Touch controls with a layout editor, and a launcher with settings (FPS overlay, FSR), work on the device.
+
+Not proven:
+
+- A physical controller on the device (the mapping is written and shared with the PC code; no pad was connected).
+- Sessions longer than 15 minutes, and thermal behaviour over them.
+- iOS: planned later via a cloud build, not started.
+
+Open: an in-app builder flow with progress, update channel and crash reporter (A5); a Release (non-debug)
+build and signing; checking PAL and Japanese discs.
+
 ## Open
 
 | Item | State |

@@ -265,3 +265,98 @@ change).
 The rest of the launcher is unchanged: the same palette, hand-painted controls, DPI
 scaling, controller polling and `controllers.ini` editor. The only new dependency is
 `comdlg32`/`ole32` for the file pickers, and the shell's drop handler for dragged paths.
+
+## ADR-016 - Android port first, iOS later via cloud build
+
+**Status:** accepted (2026-11-26)
+
+The project runs natively on Windows x64. A phone port was asked for, with the Samsung Galaxy
+M33 5G (Exynos 1280, Mali-G68 MP4, Vulkan 1.1) as the first target. The runtime fork already
+builds for 64-bit Arm Linux (Raspberry Pi 5), the generated C has no x86 intrinsics, and the NDK
+Clang supports the `musttail` calls the generated code uses, so Android is the cheaper first
+mobile target. iOS needs a Mac, a signing identity and Apple's rules on loading code; the
+Windows PC alone cannot build or sign it.
+
+Decision:
+
+- Android arm64-v8a first, from the same repository (new top-level `android` folder) and the
+  same generated sources as Windows.
+- SDL3 provides window, input, audio and the Vulkan surface on Android, through a small platform
+  layer (`window_sdl.c`, `audio_output_sdl.c`, `host_input.c`).
+- The runtime is built as `libwiirecomp.so` and the title as `libtitle.so` on the user's PC from
+  the user's own dump (`tools\android-build.ps1`) and pushed with adb (`tools\android-push.ps1`);
+  the image is read from app-specific storage. Nothing derived from the game is committed or
+  distributed (ADR-008), so the repository holds no game data. The app icon and label from the
+  user's own disc are made locally (`tools\android-branding.py`) and never tracked; the tracked
+  defaults are a neutral icon and the label SeaOfStar-ToD.
+- The game runs in its own process (`:game`); leaving it ends the process.
+- Every capability is gated by evidence (milestones A0-A5 in `docs/android-port-plan.md`), and
+  30 fps is reported honestly, as on PC (ADR-007). No fake modes.
+- iOS is deferred and not started. Static recompilation needs no JIT, which is why iOS is
+  plausible, but a title library the user builds cannot be loaded into a signed app, so an iOS
+  build would have to link the title statically and be built and signed per user by a Mac or a
+  cloud build service (Codemagic is the candidate). That is a later ADR. [hypothesis]
+
+Alternatives: iOS first (needs Mac/signing and a static-link title mode before anything runs);
+a single-library Android build with the title linked into the runtime (simplest loading, but
+every rebuild of the title relinks and repackages the whole app); NativeActivity without SDL
+(less Java, but loses SDL's controller, sensor and audio code the runtime already uses);
+an Android emulator test of the Windows build (proves nothing about the phone's GPU or CPU).
+
+Consequences: the runtime gains target-independent platform interfaces (window, audio, network,
+remotes) and an explicit cross-build target; the Android shell, builder flow and touch UI are
+new components to maintain.
+
+## ADR-017 - No dual-source blending on Android: one pass where provably equal, else a second alpha pass
+
+**Status:** accepted (2026-11-26)
+
+GX blending reads the stages' alpha through the SOURCE1 factors while the alpha channel stores a
+different alpha. On PC this is dual-source blending. The phone's Vulkan driver does not expose
+`dualSrcBlend`, so the runtime needs another way to get both alphas through one colour output.
+
+Decision: `gx_alpha_split.h` decides per draw (a pure function of the render state, unit-tested
+in `test/c/test_alpha_split.c`):
+
+- Draw once, outputting the stages' alpha, when the result is exactly the same number as the
+  dual-source formulation: colour not written and no alpha factor reads it, or the source alpha
+  factor is ZERO (the product is exactly 0 in UNORM8 whatever the stored alpha is), or a constant
+  alpha of 0.
+- Otherwise draw twice: the normal draw, then an alpha-only draw with the alpha to store. There
+  is no exact single-pass form for a constant other than 0.
+- `WII_RECOMP_GX_DEBUG=fullalphapass` restores the earlier rule (a second pass wherever a
+  SOURCE1 factor is read) for comparison.
+
+Measured on the Galaxy M33 in town, throttled (CPU capped at 1.54 GHz, GPU 611 MHz): the median
+frame was 50 ms with the earlier rule and 33.3-33.4 ms after (p95 35.8-37.9 ms, no frame over
+50 ms). In that scene draws per frame fell from 7311 to 6733, second alpha passes from 6733 to
+0, and pipeline binds from 13506 to 215. Every single-pass case above is bit exact, not an
+approximation.
+
+Alternatives: always two passes (correct, but measured too slow when throttled); using the
+stage alpha as the stored alpha everywhere (wrong alpha in the framebuffer, which later draws
+read).
+
+## ADR-018 - Android thread placement: the game thread and the commands thread get the fastest cores
+
+**Status:** accepted (2026-11-26)
+
+The Exynos 1280 has two Cortex-A78 and six Cortex-A55 cores. The recompiled game runs on one
+guest thread and a second thread feeds the GPU command ring; both are latency-bound, and the
+scheduler was free to put either on a slow core.
+
+Decision (`host_perf.c`, Android only, `WII_RECOMP_AFFINITY`):
+
+- auto (default): the game thread and the commands thread go to the phone's fastest cores,
+  read from sysfs by maximum frequency; with exactly two fastest cores each thread gets one of
+  them (measured best on the M33); other threads are left to the scheduler. A phone whose cores
+  are all alike, or that will not say, is left alone.
+- `off`, `split` or an explicit list (`6,7`) are available for measurement.
+- A performance-hint session with a 33.3 ms target tells the system what the frame needs
+  (`WII_RECOMP_PERF_HINT=off` disables it).
+- The runtime's threads are named (`host_thread.h`), so profiles say which thread is which. A
+  busy-poll in the SDL UI thread, which took 34% of the samples in a profile, was removed (below
+  1% after).
+
+Alternatives: leave placement to the scheduler; pin everything to the fast cores (they would
+then share two cores with the audio and UI threads).

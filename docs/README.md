@@ -13,6 +13,7 @@ Index of the SeaOfStar-ToD docs. Start with the progress snapshot for the curren
 | [06-legal.md](06-legal.md) | Ownership, licensing and what may be shared |
 | [07-decisions.md](07-decisions.md) | Architecture decision records (ADRs) |
 | [08-progress.md](08-progress.md) | Dated snapshot of what works, what is proven and what is open |
+| [android-port-plan.md](android-port-plan.md) | Android port: design study, milestone status, build and push tools |
 | [controls.md](controls.md) | Keyboard, mouse and gamepad controls and remapping |
 | [gx-vulkan-notes.md](gx-vulkan-notes.md) | Design notes for the GX to Vulkan renderer |
 | [shader-collection-research.md](shader-collection-research.md) | How shader recipes get collected: sweeps, merging, measured coverage |
