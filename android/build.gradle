@@ -1,0 +1,10 @@
+// The Android shell of SeaOfStar-ToD: an SDL3 Activity that runs the recompiled runtime.
+// Build (JDK 21, ANDROID_HOME set):
+//   gradlew assembleDebug                                   shell only, no native code (what CI builds)
+//   gradlew assembleDebug -PnativeLibsDir=<work\android-build> -PsdlLibDir=<SDL3 install>\lib
+//       adds libwiirecomp.so (from <dir>\stripped or <dir>) and libSDL3.so; -PbundleTitle also adds
+//       libtitle.so, only needed to boot an extracted folder (an image carries its own).
+//   add -PvalidationLayer=<libVkLayer_khronos_validation.so> for a debug build that can run the Vulkan validation layer.
+plugins {
+    id 'com.android.application' version '9.5.3' apply false
+}

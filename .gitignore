@@ -38,6 +38,11 @@ controllers.ini
 
 # Game-derived or machine-specific data
 *.wrd
+*.so
+*.apk
+*.aab
+perf.data*
+local.properties
 shaders.bin
 profile.txt
 native-cache/

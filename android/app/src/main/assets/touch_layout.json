@@ -1,0 +1,18 @@
+{
+  "_comment": "Touch controls. Sizes are dp, measured from the named screen corner (tl, tr, bl, br) or the top centre (tc) to the element's centre. A copy named touch_layout.json in the game's data folder (Android/data/<package>/files/SO3EE9/) is used instead of this one, so it can be tuned without a new APK. D-pad left, stick bottom left, the face buttons right: the cluster mirrors the stick (anchor mirror: the stick's resting place reflected across the screen, x and y in dp right and down from that point; A sits there, slightly toward the corner), and an element with an arc {of, angle, dist} is put around the element it names (angle in degrees, up is 90; dist in dp, centre to centre) at a spot found from the game's real picture rectangle in this window (16:9 as the game is set up, or the whole window when the picture is stretched), so on a 20:9 phone B, Z and C sit mostly in the black bar. picture.avoid lists the game's HUD as picture fractions [left, top, right, bottom] that the arc buttons keep clear of: the clock bar (the item slots are not listed: the mirrored cluster position is preferred over keeping clear of them). The player's own layout (touch_layout_user.json in the same folder, written by the in-game layout editor) is applied on top of this file: positions as fractions of the window, sizes as factors. A button that does not fit is turned toward straight up and pushed outward. A D-pad arm is offset on the screen (up is up) whatever corner it is measured from. A copy in the game's data folder replaces this file, so an older copy keeps the old places. Buttons are named as the Wii's: a b one two plus minus home up down left right c z.",
+  "version": 2,
+  "picture": { "aspect": 1.7778, "avoid": [[0.57, 0.07, 0.89, 0.17]] },
+  "stick": { "zone": { "left": 0.0, "right": 0.4, "top": 0.15, "bottom": 1.0 }, "radius": 56, "rest": { "anchor": "bl", "x": 108, "y": 98 } },
+  "toggle": { "anchor": "tr", "x": 24, "y": 24, "r": 16 },
+  "elements": [
+    { "id": "a", "type": "circle", "label": "A", "button": "a", "anchor": "mirror", "x": 24, "y": 26, "r": 36, "text": 24 },
+    { "id": "b", "type": "circle", "label": "B", "button": "b", "arc": { "of": "a", "angle": 168, "dist": 80 }, "r": 29, "text": 19 },
+    { "id": "z", "type": "circle", "label": "Z", "button": "z", "arc": { "of": "a", "angle": 122, "dist": 80 }, "r": 26, "text": 16 },
+    { "id": "c", "type": "circle", "label": "C", "button": "c", "arc": { "of": "a", "angle": 76, "dist": 80 }, "r": 24, "text": 16 },
+    { "id": "minus", "type": "pill", "label": "-", "button": "minus", "anchor": "tc", "x": -96, "y": 26, "w": 52, "h": 30, "text": 16 },
+    { "id": "plus", "type": "pill", "label": "+", "button": "plus", "anchor": "tc", "x": -32, "y": 26, "w": 52, "h": 30, "text": 16 },
+    { "id": "one", "type": "pill", "label": "1", "button": "one", "anchor": "tc", "x": 32, "y": 26, "w": 52, "h": 30, "text": 16 },
+    { "id": "two", "type": "pill", "label": "2", "button": "two", "anchor": "tc", "x": 96, "y": 26, "w": 52, "h": 30, "text": 16 },
+    { "id": "dpad", "type": "dpad", "anchor": "bl", "x": 47, "y": 222, "arm": 30, "gap": 31 }
+  ]
+}

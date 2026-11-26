@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only: the game can be started from adb (adb shell am start, with string extras named WII_RECOMP_*),
+     and WII_RECOMP_* extras become environment variables (GamePaths.environment). Release builds keep it private. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+        <activity
+            android:name=".GameActivity"
+            android:exported="true"
+            tools:replace="android:exported" />
+    </application>
+</manifest>

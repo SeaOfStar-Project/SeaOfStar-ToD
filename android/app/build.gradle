@@ -1,0 +1,93 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Native libraries come from this PC's own build (tools\android-build.ps1) and are never committed.
+def nativeLibsDir = providers.gradleProperty('nativeLibsDir').orNull
+def sdlLibDir = providers.gradleProperty('sdlLibDir').orElse(providers.environmentVariable('SDL3_ANDROID_PREFIX').map { it + '/lib' }).orNull
+def bundleTitle = providers.gradleProperty('bundleTitle').isPresent()
+// -PvalidationLayer=<path to libVkLayer_khronos_validation.so> (the arm64-v8a file of the Vulkan-ValidationLayers Android release)
+// puts the Khronos validation layer beside the other libraries; the runtime turns it on with WII_RECOMP_VULKAN_VALIDATION=1.
+// Android only loads it into a debuggable app, so use it with assembleDebug and never ship such an APK.
+def validationLayer = providers.gradleProperty('validationLayer').orNull
+// -PbrandingDir=<folder made by tools\android-branding.py from the user's own dump>: its res/ overlays the neutral
+// icon and app name. Game-derived, never committed; without it the APK keeps the neutral icon and SeaOfStar-ToD.
+def brandingDir = providers.gradleProperty('brandingDir').orNull
+def brandingRes = brandingDir != null ? new File(brandingDir, 'res') : null
+if (brandingRes != null && !brandingRes.isDirectory()) throw new GradleException('brandingDir has no res/: ' + brandingDir)
+def stagedDir = layout.buildDirectory.dir('generated/nativeLibs')
+
+def stageNativeLibs = tasks.register('stageNativeLibs', Sync) {
+    into stagedDir.map { it.dir('arm64-v8a') }
+    if (nativeLibsDir != null) {
+        def needed = ['libwiirecomp.so': [nativeLibsDir + '/stripped', nativeLibsDir],
+                      'libSDL3.so'     : [sdlLibDir, nativeLibsDir + '/stripped', nativeLibsDir]]
+        if (bundleTitle) needed['libtitle.so'] = [nativeLibsDir + '/stripped', nativeLibsDir]
+        if (validationLayer != null) {
+            def layer = new File(validationLayer)
+            if (!layer.isFile()) throw new GradleException("validationLayer " + validationLayer + " is not a file")
+            from(layer)
+        }
+        needed.each { name, dirs ->
+            def found = dirs.findAll { it != null }.collect { new File(it, name) }.find { it.isFile() }
+            if (found == null) {
+                throw new GradleException("nativeLibsDir was given but ${name} is in none of: ${dirs.findAll { it != null }.join(', ')} (-PsdlLibDir names the SDL3 install's lib folder)")
+            }
+            from(found)
+        }
+    }
+}
+
+android {
+    namespace = 'io.github.seaofstarproject.tod'
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = 'io.github.seaofstarproject.tod'
+        minSdk = 30
+        targetSdk = 35
+        versionCode = 1
+        versionName = '0.1.0-a2'
+        ndk { abiFilters.add('arm64-v8a') }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    // SDL opens the libraries by path in nativeLibraryDir, so they must be extracted on install.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.directories.add(stagedDir.get().asFile.path)
+        }
+    }
+
+    if (brandingRes != null) {
+        sourceSets {
+            debug { res.directories.add(brandingRes.path) }
+            release { res.directories.add(brandingRes.path) }
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable = true
+        }
+        release {
+            minifyEnabled = false
+        }
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
+
+tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn(stageNativeLibs) }

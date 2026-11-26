@@ -1,0 +1,14 @@
+# Gradle and Android Studio output
+.gradle/
+build/
+.idea/
+*.iml
+captures/
+local.properties
+# Native code is built on the user's PC from the user's dump and is never committed
+*.so
+jniLibs/
+*.apk
+*.aab
+*.keystore
+*.jks
