@@ -6,7 +6,7 @@
 struct sockaddr_in;
 
 // /dev/net/ip/top's requests, and its errors, negated as IOS answers them (net_ip.c, and
-// net_win.c's stand-in).
+// net_stub.c's stand-in).
 enum {
   SO_ACCEPT = 1, SO_BIND = 2, SO_CLOSE = 3, SO_CONNECT = 4, SO_FCNTL = 5, SO_GETPEERNAME = 6, SO_GETSOCKNAME = 7,
   SO_GETSOCKOPT = 8, SO_SETSOCKOPT = 9, SO_LISTEN = 10, SO_POLL = 11, SO_RECVFROM = 12, SO_SENDTO = 13, SO_SHUTDOWN = 14,

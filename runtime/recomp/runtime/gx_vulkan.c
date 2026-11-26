@@ -2,8 +2,10 @@
 // picture is stored the right way up and copies aren't turned over. Shaders still
 // see OpenGL's clip space, as the viewport's height is negative.
 #define _GNU_SOURCE  // For the clock a held picture is timed by.
+#ifndef WII_PLATFORM_SDL
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +13,7 @@
 #include <time.h>
 
 #include "gx_vulkan.h"
+#include "gx_alpha_split.h"
 #include "debug.h"
 #include "timeline.h"
 
@@ -135,7 +138,11 @@ static uint8_t blocks[GX_CONSTANT_BLOCKS][GX_CONSTANT_BYTES];
 static uint32_t block_bytes[GX_CONSTANT_BLOCKS], block_offsets[GX_CONSTANT_BLOCKS];
 static unsigned blocks_waiting;
 
+#ifdef WII_PLATFORM_SDL
+static void window_prepare(void) {}  // SDL's window asks for Vulkan itself (window_sdl.c).
+#else
 static void window_prepare(void) { glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); }
+#endif
 
 static void window_ready(struct GLFWwindow *window) { vk_create_instance_and_surface(window); }
 
@@ -512,7 +519,7 @@ static void leave_strip(void) {
 
 // Called before any work, with whether that work is in the strip.
 static void route_work(int strip) {
-  if (strip_off < 0) strip_off = getenv("WII_RECOMP_NO_STRIP") != 0;
+  if (strip_off < 0) strip_off = (getenv("WII_RECOMP_NO_STRIP") != 0 || gx_debug("nostrip"));
   if (strip && !in_strip && !strip_off && !strip_rest) enter_strip();
   else if (!strip) leave_strip();
 }
@@ -532,7 +539,7 @@ static void depth_touched(int n) {
 
 static int pass_kind_learned(void) {
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_KEEP_DEPTH") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_KEEP_DEPTH") != 0 || gx_debug("keepdepth"));
   int n = depth_use.number;
   if (off || in_strip || n >= MAX_PASSES) return 0;
   return (depth_use.no_load[n] ? CLEARS_DEPTH : 0) | (depth_use.no_store[n] ? DROPS_DEPTH : 0);
@@ -554,7 +561,7 @@ static VkFramebuffer framebuffer_for(int visible, int depthless) {
 static int next_work_uses_depth, next_work_covers;
 static int depthless_pass_wanted(void) {
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_DEPTH_EVERY_PASS") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_DEPTH_EVERY_PASS") != 0 || gx_debug("depthevery"));
   int n = depth_use.number;
   return !off && !in_strip && !(side.on) && !next_work_uses_depth && n < MAX_PASSES && !depth_use.last_touched[n];
 }
@@ -924,6 +931,7 @@ static void set_pipeline(VkCommandBuffer commands, VkPipeline pipeline) {
   flush_run();
   vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   pipeline_set = pipeline;
+  gx_counters.pipeline_binds++;
 }
 
 static void set_viewport_and_scissor(VkCommandBuffer commands, const VkViewport *viewport_now, const VkRect2D *scissor_now) {
@@ -958,6 +966,11 @@ static void vertices_send(const void *vertices, int count) {
   if (packed_for != shader_in_use || !packing) packing = vk_shader_packing(shader_in_use), packed_for = shader_in_use;
   uint32_t stride = packing->stride ? packing->stride : 4;
   VkDeviceSize bytes = (VkDeviceSize)count * stride;
+  struct timespec sending;
+  if (gx_stats_wanted()) {
+    clock_gettime(CLOCK_MONOTONIC, &sending);
+    gx_counters.vertex_bytes_sent += bytes;
+  }
   reserved_at = vk_ring_take(&vk.frame->vertices, bytes, stride);
   if (reserved_at == (VkDeviceSize)-1) {
     finish_commands();
@@ -974,6 +987,11 @@ static void vertices_send(const void *vertices, int count) {
       copy_words(to, from + run->from, run->words);
       to += run->words;
     }
+  }
+  if (gx_stats_wanted()) {
+    struct timespec done;
+    clock_gettime(CLOCK_MONOTONIC, &done);
+    gx_counters.send_ns += (uint64_t)((done.tv_sec - sending.tv_sec) * 1000000000ll + (done.tv_nsec - sending.tv_nsec));
   }
 }
 
@@ -1095,7 +1113,7 @@ static int draws_copy_where_it_was(int count) {
 
 static int redraws_newest_copy(int count) {
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_KEEP_COPY_BACK") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_KEEP_COPY_BACK") != 0 || gx_debug("keepcopyback"));
   extern TevKey gx_last_tev;
   const TevKey *key = &gx_last_tev;
   if (off || in_strip || count != 4 || newest_copy.frame != frame_serial || bindings[0].texture != newest_copy.texture) return 0;
@@ -1184,12 +1202,76 @@ static int join_strip(int32_t first, int count) {
 // are counted, and a part of the pass or an early read that has come due is made the usual way.
 static int strip_repeats;  // The last draw joined the run, in the picture, with no layer at work and no bounds of its own.
 
+// Without dual-source blending, a draw that blends with the stages' alpha and also has an output alpha of its own
+// to store (a constant alpha, a logic operation's help) is drawn twice: first only its alpha channel, then the
+// rest (vk_alpha_pass_state). 0 where dual-source blending does it in one.
+static int alpha_pass_wanted(GxRenderState *alpha) { return !vk.dual_source && vk_alpha_pass_state(&state_in_use, alpha); }
+
+// With WII_RECOMP_GX_STATS=1: why a draw has a second alpha pass (pass) or what let it go without one. Counted per draw
+// of the report (gx_draw.c), draws joined into a run of strips excepted. Every pass draw blends, has a target with alpha,
+// writes alpha, so those aren't counted; a logic operation never makes one (its states have no SOURCE1 factor), it is counted to say so.
+enum {
+  WHY_K0, WHY_K255, WHY_K_OTHER, WHY_K_NONE, WHY_COLOUR_SOURCE, WHY_COLOUR_TARGET, WHY_ALPHA_FACTOR, WHY_PAIR_CLASSIC, WHY_PAIR_ADD, WHY_PAIR_PREMULTIPLIED,
+  WHY_PAIR_OTHER, WHY_SUBTRACT, WHY_DEPTH_WRITE, WHY_DEPTH_TEST, WHY_READS_TARGET_ALPHA, WHY_LOGIC_HELP, WHY_COLOUR_OFF, WHY_PASS,
+  WHY_SAVED, WHY_SAVED_NO_COLOUR, WHY_SAVED_SOURCE_ZERO, WHY_SAVED_K0
+};
+static void count_alpha(const GxRenderState *s, unsigned plan) {
+  extern TevKey gx_last_tev;
+  uint64_t *why = gx_counters.alpha_why;
+  if (plan & GX_ALPHA_PASS) {
+    why[WHY_PASS]++;
+    int k = gx_blend_constant_alpha;
+    why[k == 0 ? WHY_K0 : k == 255 ? WHY_K255 : k > 0 ? WHY_K_OTHER : WHY_K_NONE]++;
+    int source = gx_is_stage_alpha_factor(s->blend_source), target = gx_is_stage_alpha_factor(s->blend_target);
+    why[WHY_COLOUR_SOURCE] += (uint64_t)source;
+    why[WHY_COLOUR_TARGET] += (uint64_t)target;
+    why[WHY_ALPHA_FACTOR] += gx_is_stage_alpha_factor(s->blend_source_alpha) || gx_is_stage_alpha_factor(s->blend_target_alpha);
+    if (s->blend_source == GX_FACTOR_SOURCE1_ALPHA && s->blend_target == GX_FACTOR_INVERSE_SOURCE1_ALPHA) why[WHY_PAIR_CLASSIC]++;
+    else if (s->blend_source == GX_FACTOR_SOURCE1_ALPHA && s->blend_target == GX_FACTOR_ONE) why[WHY_PAIR_ADD]++;
+    else if (s->blend_source == GX_FACTOR_ONE && s->blend_target == GX_FACTOR_INVERSE_SOURCE1_ALPHA) why[WHY_PAIR_PREMULTIPLIED]++;
+    else why[WHY_PAIR_OTHER]++;
+    why[WHY_SUBTRACT] += s->blend_subtract;
+    why[WHY_DEPTH_WRITE] += s->depth_write;
+    why[WHY_DEPTH_TEST] += s->depth_test_on;
+    why[WHY_READS_TARGET_ALPHA] += s->blend_source == GX_FACTOR_TARGET_ALPHA || s->blend_source == GX_FACTOR_INVERSE_TARGET_ALPHA
+                                   || s->blend_target == GX_FACTOR_TARGET_ALPHA || s->blend_target == GX_FACTOR_INVERSE_TARGET_ALPHA;
+    why[WHY_LOGIC_HELP] += gx_last_tev.logic_help != 0;
+    why[WHY_COLOUR_OFF] += !s->color_write;
+  } else if ((plan & GX_ALPHA_STAGE) && s->alpha_write) {
+    why[WHY_SAVED]++;
+    why[WHY_SAVED_NO_COLOUR] += !s->color_write;
+    why[WHY_SAVED_SOURCE_ZERO] += s->color_write && s->blend_source_alpha == GX_FACTOR_ZERO;
+    why[WHY_SAVED_K0] += gx_blend_constant_alpha == 0;
+  }
+}
+
+// Records one draw as it is, with no joining of strips into runs.
+static void emit_draw(VkCommandBuffer commands, int primitive, int count, int32_t first) {
+  if (primitive == PRIM_TRIANGLES) {
+    vkCmdDraw(commands, (uint32_t)count, 1, (uint32_t)first, 0);
+    return;
+  }
+  if (index_buffer_bound != shape_indices.buffer) {
+    vkCmdBindIndexBuffer(commands, shape_indices.buffer, 0, VK_INDEX_TYPE_UINT16);
+    index_buffer_bound = shape_indices.buffer;
+  }
+  if (primitive == PRIM_STRIP || primitive == PRIM_FAN) {
+    uint32_t triangles = (uint32_t)(count - 2);
+    vkCmdDrawIndexed(commands, triangles * INDICES_PER_TRIANGLE, 1, primitive == PRIM_STRIP ? FIRST_STRIP_INDEX : FIRST_FAN_INDEX, first, 0);
+  } else {
+    vkCmdDrawIndexed(commands, (uint32_t)(count / VERTICES_PER_QUAD) * INDICES_PER_QUAD, 1, FIRST_QUAD_INDEX, first, 0);
+  }
+}
+
 static void draw(int primitive, int count) {
   if (!count) return;
+  gx_counters.draws++;
+  GxRenderState alpha_state;
   if (gx_draw_unchanged && strip_repeats && run.open && primitive == PRIM_STRIP && !blocks_waiting && restarts == reserved_restarts
-      && !(kick_draws > 0 && draws_since_submit >= (unsigned)kick_draws) && !early_read_due()) {
+      && !(kick_draws > 0 && draws_since_submit >= (unsigned)kick_draws) && !early_read_due() && !alpha_pass_wanted(&alpha_state)) {
     if (state_in_use.depth_write) depth_changed(), flat_depth.known = 0, early_depth_changed();
     if (join_strip((int32_t)(reserved_at / reserved_stride), count)) {
+      gx_counters.strip_joined++;
       recorded_draws++;
       draws_since_submit++;
       return;
@@ -1270,7 +1352,10 @@ static void draw(int primitive, int count) {
   begin_pass(&area);
   next_work_uses_depth = next_work_covers = 0;
   if (state_in_use.depth_test_on || state_in_use.depth_write) depth_touched(depth_use.number);
-  set_pipeline(commands, vk_pipeline_find(shader_in_use, &state_in_use));
+  VkPipeline colour_pipeline = vk_pipeline_find(shader_in_use, &state_in_use);
+  int alpha_pass = alpha_pass_wanted(&alpha_state);
+  if (!vk.dual_source && gx_stats_wanted()) count_alpha(&state_in_use, vk_alpha_plan(&state_in_use));
+  set_pipeline(commands, alpha_pass ? vk_pipeline_find(shader_in_use, &alpha_state) : colour_pipeline);
   set_viewport_and_scissor(commands, &viewport_wanted, &area);
   bind_maps(commands);
   if (box.set && !box.bound) {
@@ -1287,25 +1372,24 @@ static void draw(int primitive, int count) {
   int32_t first = (int32_t)(reserved_at / reserved_stride);
   recorded_draws++;
   draws_since_submit++;
+  if (alpha_pass) {
+    // The alpha first, with the depth test as the draw has it and no depth written, so the draw's own pass
+    // finds the same pixels. Then the pipeline for the rest (colors, depth) goes on as any draw's.
+    flush_run();
+    emit_draw(commands, primitive, count, first);
+    recorded_draws++;
+    gx_counters.alpha_draws++;
+    set_pipeline(commands, colour_pipeline);
+    static int told;
+    if (!told++) fprintf(stderr, "vulkan: without dual-source blending a draw that blends with the stages' alpha and stores an alpha of its own is drawn twice (alpha first)\n");
+  }
   if (primitive == PRIM_STRIP && join_strip(first, count)) {
+    gx_counters.strip_joined++;
     strip_repeats = !in_strip && !gx_bounds_known && empty_layer.step == LAYER_IDLE && viewport_wanted.y + viewport_wanted.height < VISIBLE_HEIGHT * EFB_SCALE;
     return;
   }
   flush_run();
-  if (primitive == PRIM_TRIANGLES) {
-    vkCmdDraw(commands, (uint32_t)count, 1, (uint32_t)first, 0);
-    return;
-  }
-  if (index_buffer_bound != shape_indices.buffer) {
-    vkCmdBindIndexBuffer(commands, shape_indices.buffer, 0, VK_INDEX_TYPE_UINT16);
-    index_buffer_bound = shape_indices.buffer;
-  }
-  if (primitive == PRIM_STRIP || primitive == PRIM_FAN) {
-    uint32_t triangles = (uint32_t)(count - 2);
-    vkCmdDrawIndexed(commands, triangles * INDICES_PER_TRIANGLE, 1, primitive == PRIM_STRIP ? FIRST_STRIP_INDEX : FIRST_FAN_INDEX, first, 0);
-  } else {
-    vkCmdDrawIndexed(commands, (uint32_t)(count / VERTICES_PER_QUAD) * INDICES_PER_QUAD, 1, FIRST_QUAD_INDEX, first, 0);
-  }
+  emit_draw(commands, primitive, count, first);
 }
 
 // Vulkan's own clears ignore the write flags, so this draws over the rectangle instead.
@@ -1332,7 +1416,7 @@ static void clear_now(const GxClear *c) {
     }
   }
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_DRAW_CLEARS") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_DRAW_CLEARS") != 0 || gx_debug("drawclears"));
   if (!off && !pass_open && c->color_write == c->alpha_write) {
     VkRect2D wanted = clip_to_efb(&c->area);
     int replaces = rectangle_holds(&wanted, &waiting_clear.area) && !(waiting_clear.kind & ~((c->color_write ? CLEARS_COLOR : 0) | (c->depth_write ? CLEARS_DEPTH : 0)));
@@ -1382,6 +1466,15 @@ static void blit_areas(const GxRectangle *from, int width, int height, VkOffset3
   target[1] = (VkOffset3D){(skipped_x + (int)clipped.extent.width) * width / full_width, (skipped_y + (int)clipped.extent.height) * height / full_height, 1};
 }
 
+// The same for the window's pictures: where the game's picture goes, with bars around it where the
+// window's shape isn't the game's (vk_window_rect).
+static void window_areas(const GxRectangle *from, VkOffset3D source[2], VkOffset3D target[2]) {
+  int x, y, width, height;
+  vk_window_rect(&x, &y, &width, &height);
+  blit_areas(from, width, height, source, target);
+  target[0].x += x, target[1].x += x, target[0].y += y, target[1].y += y;
+}
+
 static VkExtent3D blit_extent(const VkImageBlit *blit) {
   return (VkExtent3D){(uint32_t)(blit->srcOffsets[1].x - blit->srcOffsets[0].x), (uint32_t)(blit->srcOffsets[1].y - blit->srcOffsets[0].y), 1};
 }
@@ -1416,7 +1509,7 @@ static int flat_count;
 
 static VkImageView flat_image(int depth, const float value[4], GxChannels channels) {
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_NO_FLAT_COPIES") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_NO_FLAT_COPIES") != 0 || gx_debug("noflat"));
   if (off) return VK_NULL_HANDLE;
   int found = -1;
   for (int i = 0; i < flat_count && found < 0; i++) {
@@ -1568,7 +1661,7 @@ static void copy_color_now(GxTexture *to, const GxRectangle *from, int width, in
 static void copy_depth_now(GxTexture *to, const GxRectangle *from, int width, int height) {
   if (width <= 0 || height <= 0) return;
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_NO_FLAT_DEPTH") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_NO_FLAT_DEPTH") != 0 || gx_debug("noflatdepth"));
   VkCommandBuffer commands = vk.frame->draw;
   GxChannels channels = {GX_CHANNEL_RED, GX_CHANNEL_RED, GX_CHANNEL_RED, GX_CHANNEL_ONE};
   if (!off && flat_depth.known && from->x >= 0 && from->y >= 0 && from->x + from->width <= EFB_WIDTH && from->y + from->height <= VISIBLE_HEIGHT) {
@@ -1607,7 +1700,7 @@ static struct { GxTexture *to; GxRectangle from; int width, height; uint32_t don
 
 static void copy_depth_early(const GxRectangle *from) {
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_NO_EARLY_DEPTH") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_NO_EARLY_DEPTH") != 0 || gx_debug("noearlydepth"));
   if (off || !early_depth.to || in_strip || early_depth.done_frame == frame_serial || memcmp(from, &early_depth.from, sizeof *from)) return;
   copy_depth_now(early_depth.to, from, early_depth.width, early_depth.height);
   early_depth.done_frame = frame_serial;
@@ -1796,13 +1889,13 @@ static const char *const rcas_fragment_source =
   "layout(location = 0) out vec4 out_color;\n"
   "\n"
   "vec3 rcas_load(ivec2 p) {\n"
-  "  ivec2 limit = ivec2(textureSize(source_image, 0)) - ivec2(1);\n"
-  "  return texelFetch(source_image, clamp(p, ivec2(0), limit), 0).rgb;\n"
+  "  ivec2 lo = ivec2(fsr.rect.xy), hi = lo + ivec2(fsr.rect.zw) - ivec2(1);\n"
+  "  return texelFetch(source_image, clamp(p, lo, hi), 0).rgb;\n"
   "}\n"
   "float safe_rcp(float x) { return abs(x) > 1.0 / 1048576.0 ? 1.0 / x : 0.0; }\n"
   "\n"
   "void main() {\n"
-  "  ivec2 ip = ivec2(gl_FragCoord.xy) - ivec2(fsr.rect.xy);\n"
+  "  ivec2 ip = ivec2(gl_FragCoord.xy);\n"  // EASU drew at window coordinates, so RCAS reads the same ones
   "  vec3 b = rcas_load(ip + ivec2(0, -1));\n"
   "  vec3 d = rcas_load(ip + ivec2(-1, 0));\n"
   "  vec3 e = rcas_load(ip);\n"
@@ -1960,14 +2053,14 @@ static int fsr_ensure(void) {
 static int fsr_present(VkCommandBuffer commands, uint32_t image_index, const GxRectangle *from) {
   if (!fsr_ensure() || image_index >= fsr.framebuffer_count) return 0;
   VkOffset3D source[2], target[2];
-  blit_areas(from, (int)vk.swap_extent.width, (int)vk.swap_extent.height, source, target);
+  window_areas(from, source, target);
   const int src_w = source[1].x - source[0].x, src_h = source[1].y - source[0].y;
   const int dst_x = target[0].x, dst_y = target[0].y;
   const int dst_w = target[1].x - target[0].x, dst_h = target[1].y - target[0].y;
   static int told;
   if (!told) {
     told = 1;
-    fprintf(stderr, "fsr: %dx%d at %d,%d into %dx%d at %d,%d\n", src_w, src_h, source[0].x, source[0].y, dst_w, dst_h, dst_x, dst_y);
+    fprintf(stderr, "fsr: destination rect used (viewport and scissor): %dx%d at %d,%d into %dx%d at %d,%d\n", src_w, src_h, source[0].x, source[0].y, dst_w, dst_h, dst_x, dst_y);
   }
   if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || dst_w < src_w || dst_h < src_h) return 0;
 
@@ -2034,7 +2127,8 @@ static int fsr_present(VkCommandBuffer commands, uint32_t image_index, const GxR
   return 1;
 }
 
-// The frame rate, drawn in the window's top right when WII_RECOMP_FPS_OVERLAY is on. The
+// The frame rate, drawn in the window's top right when WII_RECOMP_FPS_OVERLAY is on (=left: in the top left of the
+// game's picture, clear of Android's touch-controls button). The
 // glyphs are a 5 by 7 pixel font kept in the shader, so the overlay needs no texture or
 // font file; the pass loads the picture that is already in the window and writes only the
 // small box. It runs after the blit or the FSR upscale, in the same commands.
@@ -2043,7 +2137,7 @@ typedef struct { uint32_t glyphs[16]; float meta[4], color[4]; } OverlayPush;
 enum { OVERLAY_GLYPHS = 8 };
 
 static struct {
-  int enabled, read;
+  int enabled, read, left;  // left: the box sits in the picture's top left, not the window's top right
   float fps;
   uint64_t window_start;
   uint32_t window_frames;
@@ -2062,11 +2156,12 @@ static int overlay_wanted(void) {
   overlay.read = 1;
   const char *on = getenv("WII_RECOMP_FPS_OVERLAY");
   overlay.enabled = on && *on && strcmp(on, "0");
+  overlay.left = overlay.enabled && !strcmp(on, "left");
   if (overlay.enabled && !vk.swap_drawable) {
     fprintf(stderr, "overlay: the window's pictures can't be drawn into; leaving the frame rate out\n");
     overlay.enabled = 0;
   }
-  if (overlay.enabled) fprintf(stderr, "overlay: the frame rate is drawn in the window's top right\n");
+  if (overlay.enabled) fprintf(stderr, "overlay: the frame rate is drawn in the %s\n", overlay.left ? "picture's top left" : "window's top right");
   return overlay.enabled;
 }
 
@@ -2080,12 +2175,12 @@ void vk_overlay_reset(void) {
   free(overlay.views);
   if (overlay.pass) vkDestroyRenderPass(vk.device, overlay.pass, 0);
   if (overlay.layout) vkDestroyPipelineLayout(vk.device, overlay.layout, 0);
-  int enabled = overlay.enabled, read = overlay.read;
+  int enabled = overlay.enabled, read = overlay.read, left = overlay.left;
   float fps = overlay.fps;
   uint64_t start = overlay.window_start;
   uint32_t frames = overlay.window_frames;
   memset(&overlay, 0, sizeof overlay);
-  overlay.enabled = enabled, overlay.read = read, overlay.fps = fps;
+  overlay.enabled = enabled, overlay.read = read, overlay.left = left, overlay.fps = fps;
   overlay.window_start = start, overlay.window_frames = frames;
 }
 
@@ -2116,7 +2211,7 @@ static const char *const overlay_fragment_source =
   "void main() {\n"
   "  float scale = o.meta.y, count = o.meta.x;\n"
   "  float text_w = (count * 6.0 - 1.0) * scale, text_h = 7.0 * scale;\n"
-  "  vec2 origin = vec2(o.meta.z - 14.0 - text_w, 14.0);\n"
+  "  vec2 origin = o.color.x > 0.5 ? vec2(o.color.y + 14.0, 14.0) : vec2(o.meta.z - 14.0 - text_w, 14.0);\n"
   "  vec2 lo = origin - 6.0, hi = origin + vec2(text_w, text_h) + 6.0;\n"
   "  vec2 p = gl_FragCoord.xy;\n"
   "  if (p.x < lo.x || p.y < lo.y || p.x >= hi.x || p.y >= hi.y) discard;\n"
@@ -2225,7 +2320,11 @@ static void overlay_draw(VkCommandBuffer commands, uint32_t image_index) {
   if (scale < 3) scale = 3;
   push.meta[0] = (float)count, push.meta[1] = (float)scale;
   push.meta[2] = (float)vk.swap_extent.width, push.meta[3] = (float)vk.swap_extent.height;
-  push.color[0] = push.color[1] = push.color[2] = push.color[3] = 1.0f;
+  if (overlay.left) {
+    int picture_x, picture_y, picture_w, picture_h;
+    vk_window_rect(&picture_x, &picture_y, &picture_w, &picture_h);
+    push.color[0] = 1.0f, push.color[1] = (float)picture_x;
+  }
 
   VkRenderPassBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = overlay.pass,
                                  .framebuffer = overlay.framebuffers[image_index], .renderArea = {{0, 0}, vk.swap_extent}};
@@ -2247,7 +2346,17 @@ static void blit_to_window(VkCommandBuffer commands, uint32_t image_index, const
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     efb_color_to_source(commands);
     VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}};
-    blit_areas(from, (int)vk.swap_extent.width, (int)vk.swap_extent.height, blit.srcOffsets, blit.dstOffsets);
+    window_areas(from, blit.srcOffsets, blit.dstOffsets);
+    int bars_x, bars_y, bars_w, bars_h;
+    vk_window_rect(&bars_x, &bars_y, &bars_w, &bars_h);
+    if (bars_w != (int)vk.swap_extent.width || bars_h != (int)vk.swap_extent.height) {
+      // Bars: the picture doesn't reach the edges, and a fresh window picture holds anything.
+      VkClearColorValue black = {{0, 0, 0, 1}};
+      VkImageSubresourceRange whole = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vkCmdClearColorImage(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);
+      VkMemoryBarrier after_clear = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+      vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after_clear, 0, 0, 0, 0);
+    }
     vkCmdBlitImage(commands, vk.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     efb_color_to_target(commands);
     barrier(commands, image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -2323,7 +2432,7 @@ static void show_now(uint64_t when) {
   TIMELINE_BEGIN("to the display");
   VkResult presented = vkQueuePresentKHR(vk.queue, &info);
   TIMELINE_END("to the display");
-  shown_outdated |= presented == VK_SUBOPTIMAL_KHR || presented == VK_ERROR_OUT_OF_DATE_KHR;
+  shown_outdated |= vk_swapchain_stale(presented);
   last_shown = when ? when : host_nanoseconds();
   stage_shown();
 }
@@ -2332,6 +2441,8 @@ static void show_held(void) {
   // Counted from when it was due, not when this got round to it, so lateness doesn't add up.
   if (held_show.waiting && host_nanoseconds() >= held_show.due) show_now(held_show.due);
 }
+
+static uint64_t held_due(void) { return held_show.waiting ? held_show.due : 0; }
 
 static void show_or_hold(uint32_t image, int at_once) {
   static int off = -1;
@@ -2375,7 +2486,7 @@ static void present(const GxRectangle *from) {
       efb_color_to_target(frame->draw);
       vk_frame_submit(frame, VK_NULL_HANDLE, vk_window_copied(slot));
       VkOffset3D source[2], target[2];
-      blit_areas(from, (int)vk.swap_extent.width, (int)vk.swap_extent.height, source, target);
+      window_areas(from, source, target);
       outdated = vk_window_show(slot, source, target);
     } else {
       vk_frame_submit(frame, VK_NULL_HANDLE, VK_NULL_HANDLE);
@@ -2387,7 +2498,7 @@ static void present(const GxRectangle *from) {
   VkResult acquired = !pictures_off && vk.swapchain && !unshown ? vkAcquireNextImageKHR(vk.device, vk.swapchain, ACQUIRE_TIMEOUT_NS, frame->image_ready, VK_NULL_HANDLE, &image_index) : VK_NOT_READY;
   TIMELINE_END("window picture");
   int showing = acquired == VK_SUCCESS || acquired == VK_SUBOPTIMAL_KHR;
-  outdated = acquired == VK_SUBOPTIMAL_KHR || acquired == VK_ERROR_OUT_OF_DATE_KHR;
+  outdated = vk_swapchain_stale(acquired);
   if (showing) {
     if (overlay_wanted()) overlay_count_frame();
     vk_window_test_stall(frame->draw);
@@ -2408,7 +2519,11 @@ shown:
     window_refresh_size();
     TIMELINE_END("window size");
     // Not under a held picture: the next one sees to it.
-    if (!held_show.waiting && (outdated || !vk_swapchain_matches_window())) vk_create_swapchain();
+    if (!held_show.waiting && (outdated || !vk_swapchain_matches_window())) vk_swapchain_renew();
+  } else if ((vk.surface_lost || vk.surface) && !pictures_off && !held_show.waiting) {
+    // No swapchain (a zero-sized window, or the surface went away): ask for one every so often.
+    static unsigned asked;
+    if (++asked % 15 == 0) vk_swapchain_renew();
   }
   begin_frame(&vk.frames[(frame - vk.frames + 1) % FRAMES_IN_FLIGHT]);
 }
@@ -2707,7 +2822,7 @@ static int layer_draw(int count) {
   if (empty_layer.step == LAYER_IDLE || (in_strip && !reads_held())) return 0;
   flush_run();
   static int side_off = -1;
-  if (side_off < 0) side_off = getenv("WII_RECOMP_NO_SIDE") != 0;
+  if (side_off < 0) side_off = (getenv("WII_RECOMP_NO_SIDE") != 0 || gx_debug("noside"));
   VkRect2D where = drawn_area();
   int fits = !reads_held() && where.offset.y + (int64_t)where.extent.height <= VISIBLE_HEIGHT * EFB_SCALE;
   // Something is drawn into the cleared picture: a layer with something in it. It goes to
@@ -2752,7 +2867,7 @@ static int layer_draw(int count) {
 static void copy_color(GxTexture *to, const GxRectangle *from, int width, int height, GxChannels channels, int smooth) {
   flush_run();  // Strips gathered so far go first.
   static int off = -1;
-  if (off < 0) off = getenv("WII_RECOMP_KEEP_EMPTY_LAYERS") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_KEEP_EMPTY_LAYERS") != 0 || gx_debug("keepempty"));
   int step = empty_layer.step, usable = !off && !empty_layer.off && is_whole_picture(from) && width == EFB_WIDTH * EFB_SCALE && !smooth;
   if (step == LAYER_SIDE && usable && to != empty_layer.picture) {
     copy_from_side(to, from, width, height, channels);
@@ -3052,7 +3167,7 @@ static unsigned read_picture(int depth, const GxRectangle *area) {
 
 static void expect_read(int depth, const GxRectangle *area) {
   static int off = -1;  // WII_RECOMP_NO_EARLY_READ, for measuring.
-  if (off < 0) off = getenv("WII_RECOMP_NO_EARLY_READ") != 0;
+  if (off < 0) off = (getenv("WII_RECOMP_NO_EARLY_READ") != 0 || gx_debug("noearlyread"));
   if (!depth || early_read.off || off) return;  // Color changes with nearly every draw.
   early_read.armed_frame = frame_serial + 1;
   early_read.depth = depth;
@@ -3194,6 +3309,7 @@ const GxBackend gx_backend_vulkan = {
   .copy_depth = copy_depth,
   .present = present,
   .show_held = show_held,
+  .held_due = held_due,
   .read_texture = read_texture,
   .read_picture = read_picture,
   .expect_read = expect_read,

@@ -45,7 +45,8 @@ int main(void) {
 
   static uint8_t stream[MOST * 64];
   static Vertex planned[MOST], general[MOST];
-  int fast_draws = 0;
+  int fast_draws = 0, fused_checked = 0;
+  fused_off = 0;
   for (int draw = 0; draw < DRAWS; draw++) {
     int format = (int)(next() % 8);
     // Most draws as games send them, all four parts indexed by 16 bits; the rest anything.
@@ -69,6 +70,25 @@ int main(void) {
     float normals[CACHED_NORMALS][4];
     int kept_planned = gx_read_vertices(stream, format, count, planned);
     memcpy(normals, gx_cached_normals, sizeof normals);
+    // The vertex-at-a-time decoder, as the fused one hands over to it, must agree as well.
+    {
+      static Vertex fused[MOST];
+      float fused_normals[CACHED_NORMALS][4];
+      const Plan *plan = plan_for(format);
+      if (plan->ready && plan->fusable) {
+        fused_off = 1;
+        memset(fused, 0x5a, sizeof fused);
+        int kept_slow = gx_read_vertices(stream, format, count, fused);
+        memcpy(fused_normals, gx_cached_normals, sizeof fused_normals);
+        fused_off = 0;
+        gx_read_vertices(stream, format, count, planned);  // Back to the fused one, for the checks below.
+        fused_checked++;
+        if (kept_slow != kept_planned || memcmp(fused, planned, sizeof fused) || memcmp(fused_normals, normals, sizeof normals)) {
+          printf("FAILED draw %d: fused and planned decoders differ (format %d, kept %d and %d)\n", draw, format, kept_planned, kept_slow);
+          failures++;
+        }
+      }
+    }
     int kept_general = read_vertices_general(stream, format, count, general);
     fast_draws += plans[format].ready;
     if (kept_planned != kept_general || memcmp(planned, general, sizeof planned) || memcmp(normals, gx_cached_normals, sizeof normals)) {
@@ -91,6 +111,7 @@ int main(void) {
       if (failures > 3) break;
     }
   }
+  CHECK(fused_checked > DRAWS / 6);  // The fused decoder decoded a fair share, and agreed with the planned one.
   CHECK(fast_draws > DRAWS / 3);  // The planned decoder, not the general one, decoded most.
   return finish();
 }

@@ -122,6 +122,9 @@ typedef struct {
   // A backend may hold a finished picture back until the screen's field is over. Then the
   // commands thread calls this between commands, to show it once it's due. May be 0.
   void (*show_held)(void);
+  // When a held picture is due, in host_nanoseconds, or 0 with none held. Lets the commands thread sleep until then
+  // instead of looking every few microseconds. May be 0, which keeps it looking.
+  uint64_t (*held_due)(void);
 
   // Reading pictures back to the processor, for copies that land in memory and EFB peeks.
   // Each read starts in order after the work sent before it and gives a ticket, 0 if it

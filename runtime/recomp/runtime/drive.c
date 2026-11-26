@@ -64,6 +64,8 @@ const char *drive_platform(void) {
   return "darwin-x86_64";
 #elif defined(__APPLE__) && defined(__aarch64__)
   return "darwin-arm64";
+#elif defined(__ANDROID__) && defined(__aarch64__)
+  return "android-arm64";
 #elif defined(__linux__) && defined(__aarch64__)
   return "linux-aarch64";
 #elif defined(__linux__) && defined(__x86_64__)

@@ -39,14 +39,14 @@ shaderc, the C++ runtime), until they're copied beside it.
 - **Graphics commands** run on a thread of their own, as on the Mac and Linux, through a
   ring mapped twice in a row with placeholders (`VirtualAlloc2`, `MapViewOfFile3`, from
   Windows 10 1803 on). Short sleeps use a high-resolution waitable timer.
-- **Sound** goes out through SDL3 (`audio_output_win.c`).
+- **Sound** goes out through SDL3 (`audio_output_sdl.c`).
 - **The control pipe** (`WII_RECOMP_CONTROL`) is a Windows named pipe: `wii` is
   `\\.\pipe\wii`.
 - **POSIX calls** mingw-w64 lacks are in `win_compat.c`, declared in `win/`.
 
 ## Not there yet
 
-- The network (`net_win.c` answers that there's no link).
-- Real Wii Remotes (`remote_link_win.c` reads none; the simulated remote is used, and
+- The network (`net_stub.c` answers that there's no link).
+- Real Wii Remotes (`remote_link_stub.c` reads none; the simulated remote is used, and
   `WII_RECOMP_REMOTES=real` says none will connect).
 - The Wii Menu's hand-over between titles, which uses `exec`.

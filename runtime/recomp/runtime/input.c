@@ -16,7 +16,7 @@ static const float SHAKE_G = 2.5f;  // Well past what KPAD counts as a shake.
 
 typedef struct {
   int connected, attachment_chosen;
-  uint32_t held, pulsed, pad;
+  uint32_t held, pulsed, pad, host;
   uint64_t pulse_until, shake_until;
   float pointer_x, pointer_y, roll;
   float sticks[4];
@@ -64,9 +64,9 @@ static const char *button_list(uint32_t buttons, char out[96]) {
   return out;
 }
 
-static const char *const source_names[] = {"pipe", "keyboard", "pad", "mouse"};
+static const char *const source_names[INPUT_SOURCES] = {"pipe", "keyboard", "pad", "mouse", "touch"};
 // One pointer line at most this often for each player and source, the first one always.
-static uint64_t pointer_logged[PLAYERS][4];
+static uint64_t pointer_logged[PLAYERS][INPUT_SOURCES];
 
 // Called with the lock held. The pipe keeps its old line format ("input pointer p1 x y").
 static void log_pointer(InputSource source, int player, float x, float y) {
@@ -142,7 +142,24 @@ void input_stick(int player, float x, float y) {
 // Called with the lock held.
 static uint32_t current_buttons(Player *p) {
   if (p->pulsed && time_base() >= p->pulse_until) p->pulsed = 0;
-  return p->held | p->pulsed | p->pad;
+  return p->held | p->pulsed | p->pad | p->host;
+}
+
+void input_host_buttons(int player, uint32_t buttons) {
+  if (!valid(player)) return;
+  char names[96];
+  pthread_mutex_lock(&lock);
+  if (players[player].host != buttons) fprintf(stderr, "input touch p%d buttons %s\n", player + 1, button_list(buttons, names));
+  players[player].host = buttons;
+  pthread_mutex_unlock(&lock);
+}
+
+void input_host_stick(int player, float x, float y) {
+  if (!valid(player)) return;
+  pthread_mutex_lock(&lock);
+  players[player].sticks[0] = players[player].nunchuk_stick[0] = x;
+  players[player].sticks[1] = players[player].nunchuk_stick[1] = y;
+  pthread_mutex_unlock(&lock);
 }
 
 void input_pad_buttons(int player, uint32_t buttons) {

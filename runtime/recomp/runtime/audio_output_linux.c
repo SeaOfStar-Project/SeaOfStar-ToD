@@ -4,6 +4,7 @@
 #include <pthread.h>
 
 #include "audio.h"
+#include "host_thread.h"
 
 #define PERIOD_SAMPLES (AUDIO_FRAME_SAMPLES * 4)
 #define LATENCY_MICROSECONDS 40000
@@ -12,6 +13,7 @@ static snd_pcm_t *device;
 
 static void *output_thread(void *unused) {
   (void)unused;
+  host_thread_name("audio");
   static int16_t period[PERIOD_SAMPLES * AUDIO_CHANNELS];
   while (1) {
     audio_pull(period, PERIOD_SAMPLES);

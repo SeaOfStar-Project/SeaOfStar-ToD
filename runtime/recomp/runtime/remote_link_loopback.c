@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "cpu.h"
+#include "host_thread.h"
 #include "input.h"
 #include "remote_link.h"
 #include "title.h"
@@ -74,6 +75,7 @@ static void into_link(int simulated, const uint8_t *report, uint32_t bytes) {
 
 static void *devices_thread(void *unused) {
   (void)unused;
+  host_thread_name("remote-loop");
   const struct timespec millisecond = {0, 1000000};
   for (;;) {
     // A device the game turned off comes back when a button is pressed.

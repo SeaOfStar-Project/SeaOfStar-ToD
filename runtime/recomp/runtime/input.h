@@ -43,13 +43,18 @@ void input_connect(int player, int connected);
 int input_connected(int player);
 
 // Where a control came from, for the log: input_hold and input_pointer are the pipe's.
-typedef enum { INPUT_PIPE, INPUT_KEYBOARD, INPUT_PAD, INPUT_MOUSE } InputSource;
+typedef enum { INPUT_PIPE, INPUT_KEYBOARD, INPUT_PAD, INPUT_MOUSE, INPUT_HOST, INPUT_SOURCES } InputSource;
 void input_hold(int player, uint32_t buttons, int down);
 void input_hold_from(InputSource source, int player, uint32_t buttons, int down);
 void input_press(int player, uint32_t buttons);  // Held for a tenth of a second.
 void input_pointer(int player, float x, float y);
 void input_pointer_from(InputSource source, int player, float x, float y);
 void input_stick(int player, float x, float y);  // The left stick, -1 to 1 with y growing up.
+// A host program's controls (touch screen, an app's own buttons), a share of the buttons kept apart from the others'.
+// The whole set at once, so a call repeated or lost can't leave a button held. Safe from any thread.
+void input_host_buttons(int player, uint32_t buttons);
+// The left stick and the Nunchuk's together, as the pipe's stick verb does, without a log line per call.
+void input_host_stick(int player, float x, float y);
 void input_snapshot(int player, PlayerState *out);
 uint32_t input_buttons(int player);
 // A host controller's share of a player's buttons, kept apart from the keyboard's holds so

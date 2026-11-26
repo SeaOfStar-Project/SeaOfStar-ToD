@@ -12,6 +12,9 @@
 #include <unistd.h>
 
 #include "debug.h"
+#include "host_thread.h"
+#include "gx_alpha_split.h"
+#include "gx_debug.h"
 #include "gx_vulkan.h"
 
 enum {
@@ -209,6 +212,7 @@ void gx_vulkan_save_cache(void) {
 // The driver keeps its cache safe to read while another thread adds to it.
 static void *keep_saving(void *unused) {
   (void)unused;
+  host_thread_name("shader-save");
   for (;;) {
     sleep(SAVE_EVERY_SECONDS);
     gx_vulkan_save_cache();
@@ -370,7 +374,7 @@ void vk_pipelines_start(const GxAttribute *attributes, int attribute_count, size
 // A stage already compiled, in this run or an earlier one, is found by its text's hash.
 // The hash covers the prefix too, so a change to it or to the device's features is a new stage.
 static size_t full_text(char *source, size_t size, const char *text) {
-  size_t bytes = (size_t)snprintf(source, size, "%s%s%s", prefix, vk.dual_source ? "" : "#define GX_NO_DUAL_SOURCE\n", text);
+  size_t bytes = (size_t)snprintf(source, size, "%s%s%s", prefix, vk.dual_source ? "" : vk.alt_no_dual ? "#define GX_NO_DUAL_SOURCE\n#define GX_ALT_NO_DUAL\n" : "#define GX_NO_DUAL_SOURCE\n", text);
   if (bytes >= size) {
     fprintf(stderr, "shader: text too long\n");
     exit(9);
@@ -432,6 +436,7 @@ static pthread_mutex_t job_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void *compile_jobs(void *unused) {
   (void)unused;
+  host_thread_name("shader-comp");
   shaderc_compiler_t own = shaderc_compiler_initialize();
   for (;;) {
     pthread_mutex_lock(&job_lock);
@@ -548,6 +553,36 @@ static VkBlendFactor blend_factor(int which) {
   return factors[which];
 }
 
+// Without dual-source blending (and not oldnodual) the output's alpha is the stages' alpha wherever a blend reads it,
+// and the blend can't also store the alpha a draw has of its own (a constant alpha): a constant is a per-draw value and
+// the stored alpha would have to leave the output's alpha, which is also the blend's per-pixel input. No blend factor
+// or constant does that in one pass (a blend constant times the output's alpha is still the per-pixel value), except
+// where the stored alpha is 0 or isn't read at all; gx_alpha_split.h says which draws need what, and why.
+static unsigned alpha_plan(const GxRenderState *state) {
+  if (vk.dual_source || !vk.alt_no_dual) return 0;
+  return gx_alpha_plan(state, !gx_debug("noblend"), vk.alpha_simple);
+}
+
+// Whether a constant alpha of 0 has a single-pass state of its own to be built beside the one with ONE/ZERO alpha factors.
+static int zero_alpha_variant(const GxRenderState *state, GxRenderState *variant) {
+  return !vk.dual_source && vk.alt_no_dual && vk.alpha_simple && gx_alpha_zero_variant(state, variant);
+}
+
+// That alpha is stored by a pass of its own, drawn first: the same draw with the shader's output alpha being the one
+// to store (no stage alpha for the blend), nothing blended, only the alpha channel written and no depth written.
+int vk_alpha_pass_state(const GxRenderState *state, GxRenderState *alpha) {
+  if (!(alpha_plan(state) & GX_ALPHA_PASS)) return 0;
+  *alpha = *state;
+  alpha->blend_on = alpha->blend_subtract = alpha->blend_subtract_alpha = 0;
+  alpha->blend_source = alpha->blend_source_alpha = GX_FACTOR_ONE;
+  alpha->blend_target = alpha->blend_target_alpha = GX_FACTOR_ZERO;
+  alpha->color_write = 0;
+  alpha->depth_write = 0;
+  return 1;
+}
+
+unsigned vk_alpha_plan(const GxRenderState *state) { return alpha_plan(state); }
+
 static VkPipeline build_pipeline(const PipelineKey *key) {
   static const VkCompareOp tests[] = {
     [GX_TEST_NEVER] = VK_COMPARE_OP_NEVER, [GX_TEST_LESS] = VK_COMPARE_OP_LESS, [GX_TEST_EQUAL] = VK_COMPARE_OP_EQUAL,
@@ -561,9 +596,17 @@ static VkPipeline build_pipeline(const PipelineKey *key) {
   VkShaderModule vertex = stages[vertex_stage].module, fragment = stages[stage_find(key->fragment) - 1].module;
   const Layout *layout = layout_of(vertex_stage);
   VkVertexInputBindingDescription binding = {0, layout->packing.stride, VK_VERTEX_INPUT_RATE_VERTEX};
+  // The fragment shader's constant 0 says whether its output alpha is the stages' (for the blend) or the one to store.
+  // A shader with no such constant ignores it.
+  unsigned plan = alpha_plan(state);
+  int stage_alpha = (plan & GX_ALPHA_STAGE) != 0;
+  int32_t stage_alpha_value = stage_alpha;
+  VkSpecializationMapEntry stage_alpha_entry = {0, 0, sizeof stage_alpha_value};
+  VkSpecializationInfo stage_alpha_info = {1, &stage_alpha_entry, sizeof stage_alpha_value, &stage_alpha_value};
   VkPipelineShaderStageCreateInfo stage_info[2] = {
     {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vertex, .pName = "main"},
-    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragment, .pName = "main"},
+    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragment, .pName = "main",
+     .pSpecializationInfo = !vk.dual_source && vk.alt_no_dual ? &stage_alpha_info : 0},
   };
   VkPipelineVertexInputStateCreateInfo input = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
                                                 .vertexBindingDescriptionCount = layout->attribute_count ? 1 : 0, .pVertexBindingDescriptions = &binding,
@@ -572,18 +615,20 @@ static VkPipeline build_pipeline(const PipelineKey *key) {
   VkPipelineViewportStateCreateInfo viewport = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
   // The viewport's negative height keeps triangles facing as they do in OpenGL.
   VkPipelineRasterizationStateCreateInfo raster = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
-                                                   .cullMode = culls[state->cull], .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1};
+                                                   .cullMode = gx_debug("nocull") ? VK_CULL_MODE_NONE : culls[state->cull], .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1};
   VkPipelineMultisampleStateCreateInfo multisample = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
   VkPipelineDepthStencilStateCreateInfo depth = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = state->depth_test_on,
-                                                 .depthWriteEnable = state->depth_write, .depthCompareOp = tests[state->depth_test]};
+                                                 .depthWriteEnable = state->depth_write, .depthCompareOp = gx_debug("depthalways") ? VK_COMPARE_OP_ALWAYS : tests[state->depth_test]};
+  // Without dual-source blending, the output's alpha is then the stages' and not the one to store: that one goes in by the alpha pass.
+  int leave_alpha = (plan & GX_ALPHA_PASS) != 0;
   VkColorComponentFlags color = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
   VkBlendOp operation = state->blend_subtract ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD;
   VkBlendOp alpha_operation = state->blend_subtract_alpha ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD;
   VkPipelineColorBlendAttachmentState blend = {
-    .blendEnable = state->blend_on, .srcColorBlendFactor = blend_factor(state->blend_source), .dstColorBlendFactor = blend_factor(state->blend_target),
+    .blendEnable = state->blend_on && !gx_debug("noblend"), .srcColorBlendFactor = blend_factor(state->blend_source), .dstColorBlendFactor = blend_factor(state->blend_target),
     .colorBlendOp = operation, .srcAlphaBlendFactor = blend_factor(state->blend_source_alpha),
     .dstAlphaBlendFactor = blend_factor(state->blend_target_alpha), .alphaBlendOp = alpha_operation,
-    .colorWriteMask = (state->color_write ? color : 0) | (state->alpha_write ? VK_COLOR_COMPONENT_A_BIT : 0),
+    .colorWriteMask = (state->color_write ? color : 0) | (state->alpha_write && !leave_alpha ? VK_COLOR_COMPONENT_A_BIT : 0),
   };
   VkPipelineColorBlendStateCreateInfo blending = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blend};
   static const VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -599,11 +644,19 @@ static VkPipeline build_pipeline(const PipelineKey *key) {
   return pipeline;
 }
 
+// A word at a time where the key is whole words (it is a pair of 64-bit hashes and a state of small fields).
 static uint32_t hash_key(const PipelineKey *key) {
   const uint8_t *bytes = (const uint8_t *)key;
-  uint32_t hash = 2166136261u;
-  for (size_t i = 0; i < sizeof *key; i++) hash = (hash ^ bytes[i]) * 16777619u;
-  return hash;
+  size_t i = 0;
+  uint64_t hash = 14695981039346656037ull;
+  for (; i + 8 <= sizeof *key; i += 8) {
+    uint64_t word;
+    memcpy(&word, bytes + i, 8);
+    hash = (hash ^ word) * 1099511628211ull;
+    hash ^= hash >> 29;
+  }
+  for (; i < sizeof *key; i++) hash = (hash ^ bytes[i]) * 1099511628211ull;
+  return (uint32_t)(hash ^ (hash >> 32));
 }
 
 static VkPipeline vk_pipeline_find_new(GxShader shader, const GxRenderState *state);
@@ -624,13 +677,26 @@ static void grow_pipelines(void) {
   free(old);
 }
 
+// Most draws ask for the last draw's pipeline, or for one of the last few: a draw drawn twice
+// (alpha first, without dual-source blending) asks for two, one after the other, every time.
+// Those answers are kept, the oldest replaced first. WII_RECOMP_NO_PIPELINE_CACHE=1 keeps only the last, as before.
 VkPipeline vk_pipeline_find(GxShader shader, const GxRenderState *state) {
-  // Most draws ask for the last draw's pipeline: that answer is kept.
-  static struct { GxShader shader; GxRenderState state; VkPipeline pipeline; } last;
-  if (last.pipeline && shader == last.shader && !memcmp(state, &last.state, sizeof *state)) return last.pipeline;
-  last.pipeline = vk_pipeline_find_new(shader, state);
-  last.shader = shader, last.state = *state;
-  return last.pipeline;
+  enum { RECENT = 4 };
+  static struct { GxShader shader; GxRenderState state; VkPipeline pipeline; } recent[RECENT];
+  static int kept = -1;
+  if (kept < 0) kept = getenv("WII_RECOMP_NO_PIPELINE_CACHE") ? 1 : RECENT;
+  gx_counters.pipeline_lookups++;
+  for (int i = 0; i < kept; i++) {
+    if (recent[i].pipeline && shader == recent[i].shader && !memcmp(state, &recent[i].state, sizeof *state)) {
+      return recent[i].pipeline;
+    }
+  }
+  gx_counters.pipeline_misses++;
+  VkPipeline pipeline = vk_pipeline_find_new(shader, state);
+  static int oldest;
+  oldest = (oldest + 1) % kept;
+  recent[oldest].pipeline = pipeline, recent[oldest].shader = shader, recent[oldest].state = *state;
+  return pipeline;
 }
 
 static VkPipeline vk_pipeline_find_new(GxShader shader, const GxRenderState *state) {
@@ -678,7 +744,12 @@ static VkPipeline vk_pipeline_find_new(GxShader shader, const GxRenderState *sta
   return slot->pipeline;
 }
 
-void vk_pipeline_prepare(GxShader shader, const GxRenderState *state) { vk_pipeline_find(shader, state); }
+void vk_pipeline_prepare(GxShader shader, const GxRenderState *state) {
+  vk_pipeline_find(shader, state);
+  GxRenderState alpha;
+  if (vk_alpha_pass_state(state, &alpha)) vk_pipeline_find(shader, &alpha);
+  if (zero_alpha_variant(state, &alpha)) vk_pipeline_find(shader, &alpha);  // For a constant alpha of 0 (gx_draw.c, apply_blending).
+}
 
 // Many pipelines at once, on as many workers as there are cores, up to 8, for the start.
 // Each is built from its key alone, and Vulkan's pipeline cache takes several threads, so
@@ -691,6 +762,7 @@ static int batch_count;
 
 static void *build_batch(void *unused) {
   (void)unused;
+  host_thread_name("pipeline-make");
   for (int i; (i = atomic_fetch_add(&batch_next, 1)) < batch_count;) batch_built[i] = build_pipeline(&batch_keys[i]);
   return 0;
 }
@@ -739,13 +811,26 @@ static int build_many(PipelineKey *keys, int count, int write_down) {
 }
 
 void vk_pipelines_prepare(int count, const GxShader *shaders_used, const GxRenderState *states) {
-  PipelineKey *keys = calloc((size_t)count + 1, sizeof *keys);
+  PipelineKey *keys = calloc((size_t)count * 3 + 1, sizeof *keys);
+  int total = 0;
   for (int i = 0; i < count; i++) {
-    keys[i].vertex = stages[shaders[shaders_used[i] - 1].vertex].hash;
-    keys[i].fragment = stages[shaders[shaders_used[i] - 1].fragment].hash;
-    keys[i].state = states[i];
+    keys[total].vertex = stages[shaders[shaders_used[i] - 1].vertex].hash;
+    keys[total].fragment = stages[shaders[shaders_used[i] - 1].fragment].hash;
+    keys[total].state = states[i];
+    GxRenderState alpha;
+    if (vk_alpha_pass_state(&states[i], &alpha)) {  // Its alpha pass too.
+      keys[total + 1] = keys[total];
+      keys[total + 1].state = alpha;
+      total++;
+    }
+    if (zero_alpha_variant(&states[i], &alpha)) {  // And its state for a constant alpha of 0, which needs no second pass.
+      keys[total + 1] = keys[total];
+      keys[total + 1].state = alpha;
+      total++;
+    }
+    total++;
   }
-  build_many(keys, count, 1);
+  build_many(keys, total, 1);
   free(keys);
 }
 

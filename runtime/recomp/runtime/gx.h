@@ -24,6 +24,16 @@ extern GxState gx;
 // prepared_shaders are the recipe set built before the first picture.
 typedef struct { unsigned draws, copies, to_screen, draw_done, new_shaders, prepared_shaders, new_pipelines, passes, drains, waited_reads; float slowest_shader_ms, worst_frame_ms; } GxStats;
 extern GxStats gx_stats;
+// What the graphics thread did, counted for the report WII_RECOMP_GX_STATS=1 prints every ten seconds (gx_draw.c).
+// Counted on that thread only, so plain numbers. vertices: decoded by the fused, planned and general decoders.
+enum { ALPHA_WHY_COUNTS = 24 };
+typedef struct {
+  uint64_t decodes, vertices[3], indexed_parts, direct_parts, decode_ns, list_reused_vertices;
+  uint64_t alpha_why[ALPHA_WHY_COUNTS];  // Why each draw with a second alpha pass has one, and how many went without (gx_vulkan.c, count_alpha).
+  uint64_t draws, alpha_draws, strip_joined, pipeline_binds, pipeline_lookups, pipeline_misses, vertex_bytes_sent, send_ns;
+} GxCounters;
+extern GxCounters gx_counters;
+int gx_stats_wanted(void);
 // Measuring what a miss costs while playing (WII_RECOMP_ACTIVITY): the time and count of programs built
 // since the last pipeline miss was reported, the pipelines built in all, and the programs built in all.
 extern double gx_miss_program_ms;
@@ -270,6 +280,8 @@ void gx_copy_to_texture(uint32_t control, int from_depth);
 int gx_target_has_alpha(void);
 // Whether the constant output alpha is in use: it needs alpha written and kept. See Dolphin's PixelShaderGen.cpp.
 int gx_constant_alpha_used(void);
+extern int gx_alpha_zero_variants;  // The backend has a single-pass state for a constant alpha of 0 (gx_alpha_split.h); set by it at start.
+extern int gx_blend_constant_alpha;  // The draw's constant alpha as a byte, or -1 where it has none. Only for the counts of WII_RECOMP_GX_STATS.
 int gx_blend_needs_second_output(const TevKey *key);
 struct GxTexture *gx_copy_find(int map);
 int gx_copy_is_depth(int map);

@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "cpu.h"
 #include "debug.h"
@@ -384,19 +385,22 @@ enum { MOST_STEPS = 12 };
 typedef struct {
   ReadPart read;     // None for a normal with its tangent and binormal, which the vertex keeps apart.
   uint8_t kind, array;
+  uint8_t op, type, n;  // For the fused decoder: OP_COMPONENTS (type, n of them), OP_COLOR (type), or OP_NONE.
   uint16_t at, out;  // The part's place in the stream's vertex, and in Vertex.
   float scale;
 } Step;
 typedef struct {
-  int ready, steps_count;
+  int ready, steps_count, fusable, indexed_steps;
   uint32_t bytes;
   Step steps[MOST_STEPS];
 } Plan;
 static Plan plans[8];
 static unsigned plan_written[8];
 
-static void plan_step(Plan *plan, ReadPart read, int kind, int array, uint32_t at, size_t out, float scale) {
-  plan->steps[plan->steps_count++] = (Step){read, (uint8_t)kind, (uint8_t)array, (uint16_t)at, (uint16_t)out, scale};
+enum { OP_NONE = 0, OP_COMPONENTS = 1, OP_COLOR = 2 };
+
+static void plan_step(Plan *plan, ReadPart read, int kind, int array, uint32_t at, size_t out, float scale, int op, int type, int n) {
+  plan->steps[plan->steps_count++] = (Step){read, (uint8_t)kind, (uint8_t)array, (uint8_t)op, (uint8_t)type, (uint8_t)n, (uint16_t)at, (uint16_t)out, scale};
 }
 
 static const Plan *plan_for(int format) {
@@ -411,18 +415,21 @@ static const Plan *plan_for(int format) {
   for (int i = 0; i < TEXTURES; i++) at += (uint32_t)f->texture_index[i];
   if (f->position != KIND_NONE) {
     uint32_t direct = (uint32_t)f->position_components * component_bytes(f->position_type);
-    plan_step(plan, components_reader(f->position_type, f->position_components), f->position, ARRAY_POSITION, at, offsetof(Vertex, position), f->position_scale);
+    plan_step(plan, components_reader(f->position_type, f->position_components), f->position, ARRAY_POSITION, at, offsetof(Vertex, position), f->position_scale,
+              OP_COMPONENTS, f->position_type, f->position_components);
     at += attribute_bytes(f->position, direct);
   }
   if (f->normal != KIND_NONE) {
     uint32_t direct = (uint32_t)f->normal_components * component_bytes(f->normal_type);
-    plan_step(plan, f->normal_components == 3 ? components_reader(f->normal_type, 3) : 0, f->normal, ARRAY_NORMAL, at, offsetof(Vertex, normal), f->normal_scale);
+    plan_step(plan, f->normal_components == 3 ? components_reader(f->normal_type, 3) : 0, f->normal, ARRAY_NORMAL, at, offsetof(Vertex, normal), f->normal_scale,
+              f->normal_components == 3 ? OP_COMPONENTS : OP_NONE, f->normal_type, 3);
     at += attribute_bytes(f->normal, direct) * (uint32_t)f->normal_indexes;
   }
   int slot[2] = {0, f->color[0] == KIND_NONE ? 0 : 1};
   for (int i = 0; i < 2; i++) {
     if (f->color[i] == KIND_NONE) continue;
-    plan_step(plan, color_reader(f->color_type[i]), f->color[i], ARRAY_COLOR + i, at, offsetof(Vertex, color) + (size_t)slot[i] * sizeof(float[4]), 0);
+    plan_step(plan, color_reader(f->color_type[i]), f->color[i], ARRAY_COLOR + i, at, offsetof(Vertex, color) + (size_t)slot[i] * sizeof(float[4]), 0,
+              OP_COLOR, f->color_type[i], 0);
     at += attribute_bytes(f->color[i], color_bytes(f->color_type[i]));
   }
   for (int i = 0; i < TEXTURES; i++) {
@@ -433,10 +440,16 @@ static const Plan *plan_for(int format) {
     }
     uint32_t direct = (uint32_t)f->texture_components[i] * component_bytes(f->texture_type[i]);
     plan_step(plan, components_reader(f->texture_type[i], f->texture_components[i]), f->texture[i], ARRAY_TEXTURE + i, at,
-              offsetof(Vertex, uv) + (size_t)i * sizeof(float[2]), f->texture_scale[i]);
+              offsetof(Vertex, uv) + (size_t)i * sizeof(float[2]), f->texture_scale[i],
+              OP_COMPONENTS, f->texture_type[i], f->texture_components[i]);
     at += attribute_bytes(f->texture[i], direct);
   }
   plan->bytes = format_bytes[format];
+  plan->fusable = plan->ready;
+  for (int k = 0; k < plan->steps_count; k++) {
+    plan->fusable &= plan->steps[k].op != OP_NONE;
+    plan->indexed_steps += plan->steps[k].kind >= KIND_INDEX8;
+  }
   return plan;
 }
 
@@ -534,13 +547,183 @@ static int read_vertices_planned(const Plan *plan, const Prepared *ready, const 
   return kept;
 }
 
+// The fused decoder: the same plan, run a part at a time over the whole draw instead of a vertex at
+// a time through a function for each part. Each loop below is made for one encoding (type, count
+// and kind of index), so a part's bytes go to floats with no call, no switch and nothing but the
+// reads and conversions the readers above do: every value is worked out by the same expression, so
+// the vertices come out the same bytes (test_vertex_decode.c compares them). A draw that leaves
+// vertices out by a null position index, or a format with a part the plan keeps apart, is left to
+// read_vertices_planned. WII_RECOMP_NO_FUSED_DECODE=1 turns this off.
+GxCounters gx_counters;
+static int fused_off = -1;
+
+#define INLINE static inline __attribute__((always_inline))
+
+INLINE float load_one(const uint8_t *p, int type, float scale) {
+  switch (type) {
+    case COMPONENT_U8: return (float)p[0] * scale;
+    case COMPONENT_S8: return (float)(int8_t)p[0] * scale;
+    case COMPONENT_U16: return (float)(uint16_t)big16(p) * scale;
+    case COMPONENT_S16: return (float)(int16_t)big16(p) * scale;
+    default: return as_float(big32_at(p));
+  }
+}
+
+INLINE void fused_components(const Step *s, const Array *array, const uint8_t *data, uint32_t bytes, int count, Vertex *out, int type, int n, int kind) {
+  const uint8_t *at = data + s->at;
+  const float scale = s->scale;
+  const uint32_t size = type == COMPONENT_FLOAT ? 4 : type >= COMPONENT_U16 ? 2 : type == COMPONENT_U8 || type == COMPONENT_S8 ? 1 : 4;
+  for (int v = 0; v < count; v++, at += bytes) {
+    const uint8_t *source = at;
+    if (kind != KIND_DIRECT) {
+      uint32_t index = kind == KIND_INDEX8 ? at[0] : big16(at);
+      source = element(array, s->array, index);
+      if (!source) continue;
+    }
+    float *to = (float *)((uint8_t *)&out[v] + s->out);
+    for (int i = 0; i < n; i++) to[i] = load_one(source + i * size, type, scale);
+  }
+}
+
+INLINE void fused_color(const Step *s, const Array *array, const uint8_t *data, uint32_t bytes, int count, Vertex *out, int type, int kind) {
+  const uint8_t *at = data + s->at;
+  for (int v = 0; v < count; v++, at += bytes) {
+    const uint8_t *source = at;
+    if (kind != KIND_DIRECT) {
+      uint32_t index = kind == KIND_INDEX8 ? at[0] : big16(at);
+      source = element(array, s->array, index);
+      if (!source) continue;
+    }
+    float *to = (float *)((uint8_t *)&out[v] + s->out);
+    switch (type) {
+      case COLOR_RGB565: read_rgb565(source, to, 0); break;
+      case COLOR_RGB8: read_rgb8(source, to, 0); break;
+      case COLOR_RGBA4: read_rgba4(source, to, 0); break;
+      case COLOR_RGBA6: read_rgba6(source, to, 0); break;
+      default: read_rgba8(source, to, 0);
+    }
+  }
+}
+
+#define FUSED_KINDS(T, N) \
+  switch (s->kind) { \
+    case KIND_DIRECT: fused_components(s, array, data, bytes, count, out, T, N, KIND_DIRECT); break; \
+    case KIND_INDEX8: fused_components(s, array, data, bytes, count, out, T, N, KIND_INDEX8); break; \
+    default: fused_components(s, array, data, bytes, count, out, T, N, KIND_INDEX16); \
+  }
+#define FUSED_COUNTS(T) \
+  switch (s->n) { \
+    case 1: FUSED_KINDS(T, 1) break; \
+    case 2: FUSED_KINDS(T, 2) break; \
+    default: FUSED_KINDS(T, 3) \
+  }
+
+static void fused_step(const Step *s, const Array *array, const uint8_t *data, uint32_t bytes, int count, Vertex *out) {
+  if (s->op == OP_COLOR) {
+    // A type past the last reads as the last, as color_reader has it; 1 and 2 read alike.
+    switch (s->kind) {
+      case KIND_DIRECT:
+        switch (s->type) {
+          case COLOR_RGB565: fused_color(s, array, data, bytes, count, out, COLOR_RGB565, KIND_DIRECT); break;
+          case COLOR_RGB8: case COLOR_RGBX8: fused_color(s, array, data, bytes, count, out, COLOR_RGB8, KIND_DIRECT); break;
+          case COLOR_RGBA4: fused_color(s, array, data, bytes, count, out, COLOR_RGBA4, KIND_DIRECT); break;
+          case COLOR_RGBA6: fused_color(s, array, data, bytes, count, out, COLOR_RGBA6, KIND_DIRECT); break;
+          default: fused_color(s, array, data, bytes, count, out, COLOR_RGBA8, KIND_DIRECT);
+        }
+        break;
+      case KIND_INDEX8:
+        switch (s->type) {
+          case COLOR_RGB565: fused_color(s, array, data, bytes, count, out, COLOR_RGB565, KIND_INDEX8); break;
+          case COLOR_RGB8: case COLOR_RGBX8: fused_color(s, array, data, bytes, count, out, COLOR_RGB8, KIND_INDEX8); break;
+          case COLOR_RGBA4: fused_color(s, array, data, bytes, count, out, COLOR_RGBA4, KIND_INDEX8); break;
+          case COLOR_RGBA6: fused_color(s, array, data, bytes, count, out, COLOR_RGBA6, KIND_INDEX8); break;
+          default: fused_color(s, array, data, bytes, count, out, COLOR_RGBA8, KIND_INDEX8);
+        }
+        break;
+      default:
+        switch (s->type) {
+          case COLOR_RGB565: fused_color(s, array, data, bytes, count, out, COLOR_RGB565, KIND_INDEX16); break;
+          case COLOR_RGB8: case COLOR_RGBX8: fused_color(s, array, data, bytes, count, out, COLOR_RGB8, KIND_INDEX16); break;
+          case COLOR_RGBA4: fused_color(s, array, data, bytes, count, out, COLOR_RGBA4, KIND_INDEX16); break;
+          case COLOR_RGBA6: fused_color(s, array, data, bytes, count, out, COLOR_RGBA6, KIND_INDEX16); break;
+          default: fused_color(s, array, data, bytes, count, out, COLOR_RGBA8, KIND_INDEX16);
+        }
+    }
+    return;
+  }
+  switch (s->type) {
+    case COMPONENT_U8: FUSED_COUNTS(COMPONENT_U8) break;
+    case COMPONENT_S8: FUSED_COUNTS(COMPONENT_S8) break;
+    case COMPONENT_U16: FUSED_COUNTS(COMPONENT_U16) break;
+    case COMPONENT_S16: FUSED_COUNTS(COMPONENT_S16) break;
+    default: FUSED_COUNTS(COMPONENT_FLOAT)
+  }
+}
+
+// Returns how many vertices, or -1 where a vertex is left out and the vertex-at-a-time decoder must go on.
+static int read_vertices_fused(const Plan *plan, const Prepared *ready, const uint8_t *data, int count, Vertex *out, const Format *f) {
+  const Step *steps = plan->steps;
+  const uint32_t bytes = plan->bytes;
+  for (int k = 0; k < plan->steps_count; k++) {
+    const Step *s = &steps[k];
+    if (s->array != ARRAY_POSITION || s->kind == KIND_DIRECT) continue;
+    const uint8_t *at = data + s->at;
+    if (s->kind == KIND_INDEX8) {
+      for (int v = 0; v < count; v++, at += bytes) if (at[0] == NULL_INDEX8) return -1;
+    } else {
+      for (int v = 0; v < count; v++, at += bytes) if (big16(at) == NULL_INDEX16) return -1;
+    }
+  }
+  for (int v = 0; v < count; v++) out[v] = ready->start;
+  if (f->position_index | ready->coordinate_matrix_count) {
+    for (int v = 0; v < count; v++) {
+      const uint8_t *vertex = data + (size_t)v * bytes;
+      uint32_t matrix_at = 0;
+      if (f->position_index) out[v].matrix[VERTEX_MATRIX_POSITION] = vertex[matrix_at++] & MATRIX_INDEX_MASK;
+      for (int k = 0; k < ready->coordinate_matrix_count; k++) out[v].matrix[VERTEX_MATRIX_COORDINATE + ready->coordinate_matrices[k]] = vertex[matrix_at++] & MATRIX_INDEX_MASK;
+    }
+  }
+  for (int k = 0; k < plan->steps_count; k++) fused_step(&steps[k], &ready->arrays[k], data, bytes, count, out);
+  keep_last_normals(f, &out[count - 1]);
+  return count;
+}
+
+static int stats_on = -1;
+int gx_stats_wanted(void) {
+  if (stats_on < 0) stats_on = getenv("WII_RECOMP_GX_STATS") != 0;
+  return stats_on;
+}
+
+static uint64_t counter_clock(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
+}
+
 int gx_read_vertices(const uint8_t *data, int format, int count, Vertex *out) {
   format &= 7;
   const Plan *plan = plan_for(format);
+  uint64_t began = gx_stats_wanted() ? counter_clock() : 0;
+  int kept, path = 0;
   // A display list's draw kept for reuse records which indexes it read, which only the general decoder does.
-  if (!plan->ready || spans.on) return read_vertices_general(data, format, count, out);
-  const Format *f = format_for(format);
-  return read_vertices_planned(plan, prepare(format, plan, f), data, count, out, f);
+  if (!plan->ready || spans.on) {
+    kept = read_vertices_general(data, format, count, out);
+    path = 2;
+  } else {
+    const Format *f = format_for(format);
+    const Prepared *ready = prepare(format, plan, f);
+    if (fused_off < 0) fused_off = getenv("WII_RECOMP_NO_FUSED_DECODE") != 0;
+    kept = plan->fusable && !fused_off ? read_vertices_fused(plan, ready, data, count, out, f) : -1;
+    if (kept < 0) kept = read_vertices_planned(plan, ready, data, count, out, f), path = 1;
+  }
+  if (began) {
+    gx_counters.decode_ns += counter_clock() - began;
+    gx_counters.vertices[path] += (uint64_t)count;
+    gx_counters.indexed_parts += (uint64_t)count * (uint64_t)plan->indexed_steps;
+    gx_counters.direct_parts += (uint64_t)count * (uint64_t)(plan->steps_count - plan->indexed_steps);
+    gx_counters.decodes++;
+  }
+  return kept;
 }
 
 // Display lists: models are drawn by calling the same lists frame after frame, and their
@@ -657,6 +840,7 @@ int gx_read_list_vertices(const uint8_t *data, int format, int count, Vertex *ou
     memcpy(out, d->vertices, (size_t)d->kept * sizeof(Vertex));
     if (d->sets_normals) memcpy(gx_cached_normals, d->normals, sizeof d->normals);
     gx_list_draws_reused++;
+    gx_counters.list_reused_vertices += (uint64_t)d->kept;
     return d->kept;
   }
   gx_list_draws_decoded++;

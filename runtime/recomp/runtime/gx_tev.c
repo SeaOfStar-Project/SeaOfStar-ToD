@@ -587,8 +587,8 @@ static void add_stage(ShaderText *text, const TevKey *key, int index) {
     gx_text_add(text, ";\n");
   }
   if (s->color_bias == BIAS_COMPARE || s->alpha_bias == BIAS_COMPARE) {
-    gx_text_add(text, "    ivec4 ia = ivec4(floor(vec4(ca, aa) * 255.0 + 0.5)) & 255, ib = ivec4(floor(vec4(cb, ab) * 255.0 + 0.5)) & 255;\n"
-                      "    ivec4 ic = ivec4(floor(vec4(cc, ac) * 255.0 + 0.5)) & 255;\n");
+    gx_text_add(text, "    ivec4 ia = wrap255(ivec4(floor(vec4(ca, aa) * 255.0 + 0.5))), ib = wrap255(ivec4(floor(vec4(cb, ab) * 255.0 + 0.5)));\n"
+                      "    ivec4 ic = wrap255(ivec4(floor(vec4(cc, ac) * 255.0 + 0.5)));\n");
   }
   if (s->color_bias == BIAS_COMPARE) {
     gx_text_add(text, "    vec3 color = cd + ");
@@ -694,8 +694,13 @@ void gx_tev_write_shader(const TevKey *key, int bounding_box, ShaderText *text) 
   gx_text_add(text, "layout(location = 0, index = 0) out vec4 out_color;\n");
   // Blending reads a second output only when the stored alpha differs from the stages'.
   // A second output costs a tile-based chip a second write of every pixel.
+  // Some drivers (Mali's) get "&" between two integer vectors wrong when one isn't a constant, so
+  // the vector forms below are written one component at a time (as Dolphin's PixelShaderGen does).
+  int wraps = key->wrap_output;
+  for (int i = 0; i < key->stages; i++) wraps |= key->stage[i].color_bias == BIAS_COMPARE || key->stage[i].alpha_bias == BIAS_COMPARE;
+  if (wraps) gx_text_add(text, "ivec4 wrap255(ivec4 v) { return ivec4(v.x & 255, v.y & 255, v.z & 255, v.w & 255); }\n");
   if (gx_blend_needs_second_output(key)) {
-    gx_text_add(text, "#ifdef GX_NO_DUAL_SOURCE\nvec4 blend_alpha;\n#else\nlayout(location = 0, index = 1) out vec4 blend_alpha;\n#endif\n");
+    gx_text_add(text, "#ifdef GX_NO_DUAL_SOURCE\nvec4 blend_alpha;\n#ifdef GX_ALT_NO_DUAL\nlayout(constant_id = 0) const int stage_alpha_out = 0;\n#endif\n#else\nlayout(location = 0, index = 1) out vec4 blend_alpha;\n#endif\n");
   } else {
     gx_text_add(text, "vec4 blend_alpha;\n");
   }
@@ -712,7 +717,7 @@ void gx_tev_write_shader(const TevKey *key, int bounding_box, ShaderText *text) 
   for (int i = 0; i < key->stages; i++) add_stage(text, key, i);
   // The picture takes the last stage's own output, whichever register that was.
   gx_text_add(text, "  vec4 result = vec4(R%d.rgb, R%d.a);\n", last->color_target, last->alpha_target);
-  if (key->wrap_output) gx_text_add(text, "  result = vec4(ivec4(floor(result * 255.0 + 0.5)) & 255) / 255.0;\n");
+  if (key->wrap_output) gx_text_add(text, "  result = vec4(wrap255(ivec4(floor(result * 255.0 + 0.5)))) / 255.0;\n");
   if (key->alpha_test) {
     static const char *const joins[] = {" && ", " || ", " != ", " == "};
     gx_text_add(text, "  if (!((");
@@ -745,7 +750,12 @@ void gx_tev_write_shader(const TevKey *key, int bounding_box, ShaderText *text) 
       "    atomicMax(bounding_box[3], game_pixel.y | 1);\n"
       "  }\n", (double)gx_scale_numerator / gx_scale_denominator, (double)gx_scale_numerator / gx_scale_denominator);
   }
-  gx_text_add(text, "  out_color = result;\n}\n");
+  gx_text_add(text, "  out_color = result;\n");
+  // Without dual-source blending, the stages' alpha can still reach the blend through the output's own alpha:
+  // the pipeline says so with its specialization constant when its draw blends with that alpha, and then
+  // masks the alpha write and has the alpha to store drawn apart (vk_alpha_pass_state). Otherwise the output's alpha is the stored one.
+  if (gx_blend_needs_second_output(key)) gx_text_add(text, "#ifdef GX_ALT_NO_DUAL\n  if (stage_alpha_out != 0) out_color.a = blend_alpha.a;\n#endif\n");
+  gx_text_add(text, "}\n");
 }
 
 // Reads the game's settings, sends their values, and returns the texture maps in use.

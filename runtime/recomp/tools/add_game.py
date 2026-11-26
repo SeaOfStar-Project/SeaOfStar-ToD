@@ -46,9 +46,12 @@ RECOMP = ROOT / "recomp"
 CONSOLE_BUILD = RECOMP / "build"
 GAMES = ROOT / "games"
 TITLE_ID_OFFSET = 0x18c  # In the disc's tmd.bin.
-LIBRARY = {"darwin": "title.dylib", "win32": "title.dll"}.get(sys.platform, "title.so")
-PROGRAM = "wii-recomp.exe" if sys.platform == "win32" else "wii-recomp"
-if sys.platform == "win32":
+# --target android-arm64 cross-compiles for Android with the NDK (see tools/android-build.ps1 for
+# the environment it reads); without it, the build is for this computer.
+ANDROID = "--target" in sys.argv and sys.argv[sys.argv.index("--target") + 1:][:1] == ["android-arm64"]
+LIBRARY = "libtitle.so" if ANDROID else {"darwin": "title.dylib", "win32": "title.dll"}.get(sys.platform, "title.so")
+PROGRAM = "libwiirecomp.so" if ANDROID else "wii-recomp.exe" if sys.platform == "win32" else "wii-recomp"
+if sys.platform == "win32" and not ANDROID:
     # MSYS2's clang and ninja, and the libraries the console loads, ahead of anything else.
     MSYS2_BIN = Path(os.environ.get("MSYS2_ROOT", "C:/msys64")) / "clang64/bin"
     if not (MSYS2_BIN / "clang.exe").is_file():
@@ -66,6 +69,8 @@ def fail(message):
 
 def native_platform():
     """The platform name a recompiled disc image files this computer's native code under."""
+    if ANDROID:
+        return "android-arm64"
     system = {"Darwin": "darwin", "Linux": "linux", "Windows": "windows"}.get(platform.system())
     machine = {"AMD64": "x86_64", "x86_64": "x86_64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine())
     if system == "linux" and machine == "arm64":
@@ -263,6 +268,7 @@ def main():
     parser.add_argument("--scale", help="the picture's size against the Wii's for this game, such as 3/2, or default; remembered")
     parser.add_argument("--no-pack", action="store_true", help="build the native code but don't pack a disc image")
     parser.add_argument("--jobs", type=int, default=os.cpu_count(), help="compiles at once")
+    parser.add_argument("--target", choices=["android-arm64"], help="cross-compile for Android arm64-v8a instead of this computer; builds the console and title libraries in build-<ID>/android and does not pack an image")
     parser.add_argument("--nand", help="a Wii storage folder the title is installed in, for a channel")
     options = parser.parse_args()
 
@@ -300,9 +306,12 @@ def main():
         print("nothing has run yet, so everything compiles quickly and counts its runs")
     discovered = recorded(key, "discovered.txt", settings["consoles"])
 
-    (CONSOLE_BUILD / "obj").mkdir(parents=True, exist_ok=True)
-    run("build the console", [sys.executable, str(RECOMP / "translate/build_file.py"), str(CONSOLE_BUILD)])
-    run("compile the console", ["ninja", "-j", str(options.jobs), PROGRAM], cwd=CONSOLE_BUILD)
+    if ANDROID and (channel or settings.get("nand")):
+        fail("--target android-arm64 builds discs only, not channels")
+    if not ANDROID:
+        (CONSOLE_BUILD / "obj").mkdir(parents=True, exist_ok=True)
+        run("build the console", [sys.executable, str(RECOMP / "translate/build_file.py"), str(CONSOLE_BUILD)])
+        run("compile the console", ["ninja", "-j", str(options.jobs), PROGRAM], cwd=CONSOLE_BUILD)
     emit = [sys.executable, str(RECOMP / "translate/emit.py"), str(disc / "sys/main.dol"), str(build / "generated"),
             "--all-code", "--virtual-bluetooth", "--profile", str(profile)]
     emit += ["--fifo-breakpoints"] if settings["fifo_breakpoints"] else []
@@ -310,6 +319,17 @@ def main():
     for path in discovered:
         emit += ["--discovered", str(path)]
     run("translate the program", emit)
+    if ANDROID:
+        # The translated C is the same for every platform; the Android objects and both
+        # libraries (console and title, linked together by the NDK) live in their own folder.
+        android = build / "android"
+        (android / "obj").mkdir(parents=True, exist_ok=True)
+        run("write the Android build file", [sys.executable, str(RECOMP / "translate/build_file.py"), str(android), "--target", "android-arm64",
+                                             "--generated", str(build / "generated")])
+        run("compile the console and the title for Android", ["ninja", "-j", str(options.jobs), PROGRAM, LIBRARY], cwd=android)
+        print(f"\n{code} is built for Android in {android}: {PROGRAM}, {LIBRARY}. Nothing was packed: add the title to an image with\n"
+              f"  recomp/tools/make_disc.py <disc> <image.wrd> --native android-arm64={android / LIBRARY}")
+        return
     run("write the build file", [sys.executable, str(RECOMP / "translate/build_file.py"), str(build)])
     (build / "obj").mkdir(exist_ok=True)
     run("compile the title", ["ninja", "-j", str(options.jobs), LIBRARY], cwd=build)

@@ -13,13 +13,13 @@
 #include <vulkan/vulkan.h>
 
 #include "gx_backend.h"
+#include "gx_debug.h"
 
 enum {
   FRAMES_IN_FLIGHT = 3,
   MAX_TEXTURE_POOLS = 16,
   TEXTURE_SETS_PER_POOL = 1024,
   COLOR_FORMAT = VK_FORMAT_R8G8B8A8_UNORM,
-  DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT,  // Available everywhere, unlike 24 bits. The picture only ever compares it.
   SET_CONSTANTS = 0, SET_TEXTURES = 1, SET_BOUNDING_BOX = 2, SET_COUNT = 3,
 };
 
@@ -67,6 +67,11 @@ typedef struct {
   int depth_filters_linear, dual_source;
   int bounding_box;  // Shaders can write to a buffer, which the bounding box needs.
   float max_anisotropy;  // 0 when the device can't filter along a slope.
+  VkFormat depth_format;  // D32_SFLOAT, which the picture only ever compares; X8_D24 where that is missing (or asked for: WII_RECOMP_GX_DEBUG=depth=x8d24).
+  int alt_no_dual;  // Without dual-source blending, the output's alpha is the stages' for the blend and the stored alpha is made apart (vk_alpha_pass_state). 0 with oldnodual.
+  int alpha_simple;  // Without dual-source blending, the draws gx_alpha_split.h proves need no second pass don't get one. 0 with WII_RECOMP_GX_DEBUG=fullalphapass.
+  int surface_lost;  // The window's surface went away (VK_ERROR_SURFACE_LOST_KHR); the next present makes a new one.
+  int accept_suboptimal;  // The swapchain was made with a transform other than the surface's own, so VK_SUBOPTIMAL_KHR is expected.
   int counting;  // WII_RECOMP_GPU_COUNTERS: the card counts its own work. See gx_vulkan.c.
 
   VkSwapchainKHR swapchain;
@@ -93,6 +98,8 @@ typedef struct {
 
 extern Vulkan vk;
 
+#define DEPTH_FORMAT (vk.depth_format)
+
 // With no window, window_ready(0) makes an instance with no surface, and nothing is shown.
 // A tool that sets this gets each picture as it is presented: top row first, four bytes a pixel.
 typedef void (*VkPictureSink)(const uint8_t *rgba, int width, int height);
@@ -108,6 +115,11 @@ void vk_create_frames(void);
 Ring vk_create_ring(VkDeviceSize size, VkBufferUsageFlags usage);
 Ring vk_create_read_ring(VkDeviceSize size);  // For the card to write and the processor to read.
 void vk_create_swapchain(void);
+int vk_swapchain_stale(VkResult result);  // Whether an acquire or present result means the swapchain must be made again.
+void vk_swapchain_renew(void);  // The swapchain again, from a new surface if the old one was lost.
+int vk_recreate_surface(void);  // After VK_ERROR_SURFACE_LOST_KHR: a new surface and swapchain from the window, or 0 while the window has none.
+void vk_report_device(void);  // One block of what the device offers and what was decided (gx_vulkan_device.c).
+void vk_window_rect(int *x, int *y, int *width, int *height);  // Where the picture goes in the window's pictures (letterbox).
 int vk_swapchain_matches_window(void);
 void vk_create_image(VkFormat format, VkImageUsageFlags usage, uint32_t width, uint32_t height, uint32_t levels,
                      VkImage *image, VkDeviceMemory *memory);
@@ -142,6 +154,9 @@ typedef struct { uint8_t from, words; } VkVertexRun;
 typedef struct { uint32_t stride, run_count; VkVertexRun runs[MOST_VERTEX_RUNS]; } VkVertexPacking;
 const VkVertexPacking *vk_shader_packing(GxShader shader);
 VkPipeline vk_pipeline_find(GxShader shader, const GxRenderState *state);
+// Without dual-source blending: whether this draw's own alpha has to be stored by a pass of its own (alpha channel only), and that pass's state.
+int vk_alpha_pass_state(const GxRenderState *state, GxRenderState *alpha);
+unsigned vk_alpha_plan(const GxRenderState *state);  // GX_ALPHA_STAGE and GX_ALPHA_PASS bits (gx_alpha_split.h).
 void vk_stages_prepare(int count, const int *kinds, const char *const *texts);  // On every core.
 void vk_pipeline_prepare(GxShader shader, const GxRenderState *state);
 void vk_pipelines_prepare(int count, const GxShader *shaders, const GxRenderState *states);

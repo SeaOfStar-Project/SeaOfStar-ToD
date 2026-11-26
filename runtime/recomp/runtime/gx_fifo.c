@@ -22,6 +22,9 @@
 #endif
 
 #include "timeline.h"
+#include "host_thread.h"
+#include "host_perf.h"
+#include "host_wait.h"
 #include "cpu.h"
 #include "debug.h"
 #include "title.h"
@@ -184,7 +187,8 @@ static _Atomic uint64_t field_began;  // Host nanoseconds.
 static _Atomic uint64_t field_length = 1000000000ull / 60;
 static _Thread_local int on_commands_thread;
 static void run_handed(int between);
-static void idle_wait(void);
+static void idle_wait(uint64_t nanoseconds);
+static uint64_t idle_budget(uint64_t until);
 
 static void hold_for_field(uint32_t address) {
   enum { MOST_ALLOWED = 2 };
@@ -209,7 +213,7 @@ static void hold_for_field(uint32_t address) {
       // other time: left until the wait was over, it was shown late and the next one right
       // after it, two pictures 3 ms apart and then none for 30.
       if (gx_backend->show_held) gx_backend->show_held();
-      idle_wait();
+      idle_wait(idle_budget(give_up));
     }
     TIMELINE_END("held for the field");
     unsigned after = atomic_load(&fields_begun);
@@ -245,13 +249,17 @@ static void write_bp(uint32_t value) {
     TIMELINE_MOMENT("draw done read");
     gx_stats.draw_done++;
     finish_due = time_base() + SIGNAL_DELAY_TICKS;
+    game_wake();
   }
   else if (reg == BP_TOKEN || reg == BP_TOKEN_NOW) {
     atomic_store(&token_parsed, data & 0xffff);
     // With no interrupt for it, the value shows at once unless a handler is on its way.
     if (reg == BP_TOKEN_NOW && !atomic_load(&token_due) && !(pe_status & PE_TOKEN_DONE)) pe_token = data & 0xffff;
     TIMELINE_MOMENT("token read");
-    if (reg == BP_TOKEN) token_due = time_base() + SIGNAL_DELAY_TICKS;
+    if (reg == BP_TOKEN) {
+      token_due = time_base() + SIGNAL_DELAY_TICKS;
+      game_wake();
+    }
     if (reg == BP_TOKEN && paces_by_token) {
       held_at_token = 1;
       token_seen = retraces_held = 0;
@@ -413,7 +421,9 @@ static int threaded = -1;
 static uint64_t ring_added;  // Every byte handed to the commands thread, for the stream report.
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #define RING_BYTES (16u * 1024u * 1024u)
-#define EMPTY_TURNS_BEFORE_SLEEP 200
+#define EMPTY_TURNS_BEFORE_SLEEP 200  // WII_RECOMP_GX_SPIN=<n> changes it (0: sleep at once).
+#define HANDED_TURNS_BEFORE_SLEEP 200
+#define IDLE_LONGEST_NANOSECONDS 2000000  // The most a woken sleep waits, in case a wake is missed.
 #define EMPTY_SLEEP_NANOSECONDS 50000
 static uint8_t *ring;
 static _Atomic uint64_t ring_written, ring_parsed;
@@ -426,6 +436,9 @@ static pthread_t commands_thread_id;
 static struct { void (*work)(void *); void *argument; int soon; } handed;
 static atomic_flag handing = ATOMIC_FLAG_INIT;
 static _Atomic int handed_waiting, handed_done;
+#ifdef HOST_WAIT_FUTEX
+static Sleeper handed_sleeper;  // The thread that handed work over sleeps on this once it has spun a while.
+#endif
 
 static void run_handed(int between) {
   if (!atomic_load_explicit(&handed_waiting, memory_order_acquire) || (between && !handed.soon)) return;
@@ -437,6 +450,9 @@ static void run_handed(int between) {
   TIMELINE_END("handed work");
   atomic_store_explicit(&handed_waiting, 0, memory_order_relaxed);
   atomic_store_explicit(&handed_done, 1, memory_order_release);
+#ifdef HOST_WAIT_FUTEX
+  sleeper_wake(&handed_sleeper);
+#endif
 }
 
 static void wait_briefly(void) {
@@ -450,7 +466,8 @@ static void wait_briefly(void) {
 // cost it every other frame. So there the wait also ends when work is handed over.
 #ifdef _WIN32
 static HANDLE idle_wake;
-static void idle_wait(void) {
+static void idle_wait(uint64_t nanoseconds) {
+  (void)nanoseconds;  // Windows keeps its short polling.
   static HANDLE timer;
   if (!timer) timer = CreateWaitableTimerExW(0, 0, 2 /* high resolution */, TIMER_ALL_ACCESS);
   LARGE_INTEGER due;
@@ -469,26 +486,38 @@ static void wake_idle(void) { if (idle_wake) SetEvent(idle_wake); }
 // thread sleeps on a word the hander sets and wakes it by (a futex).
 // Commands written to the ring wake it the same way, but only when it is asleep, as the
 // game writes them a few bytes at a time and waking costs a call to the kernel.
-static _Atomic int idle_word, idle_asleep;
-static void idle_wait(void) {
-  struct timespec pause = {0, EMPTY_SLEEP_NANOSECONDS};
-  atomic_store_explicit(&idle_asleep, 1, memory_order_seq_cst);
-  if (!atomic_exchange_explicit(&idle_word, 0, memory_order_seq_cst)) syscall(SYS_futex, &idle_word, FUTEX_WAIT_PRIVATE, 0, &pause, 0, 0);
-  atomic_store_explicit(&idle_asleep, 0, memory_order_seq_cst);
-  atomic_store_explicit(&idle_word, 0, memory_order_release);
-}
-static void wake_idle(void) {
-  atomic_store_explicit(&idle_word, 1, memory_order_seq_cst);
-  if (atomic_load_explicit(&idle_asleep, memory_order_seq_cst)) syscall(SYS_futex, &idle_word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
-}
+static Sleeper idle_sleeper;
+static void idle_wait(uint64_t nanoseconds) { sleeper_wait(&idle_sleeper, nanoseconds); }
+static void wake_idle(void) { sleeper_wake(&idle_sleeper); }
 #define WAKES_FOR_COMMANDS 1
 #else
-static void idle_wait(void) { wait_briefly(); }
+static void idle_wait(uint64_t nanoseconds) { (void)nanoseconds; wait_briefly(); }
 static void wake_idle(void) {}
 #endif
 
+// How long the commands thread may sleep with nothing to parse. Where commands and handed work
+// wake it, only what has a time on it needs it up: a held picture coming due (the backend says
+// when), and `until`, a deadline the caller has (0 for none). Everything else wakes it by name, and
+// the longest sleep is only for a wake that goes missing. A backend that can't say when a held
+// picture is due, or a platform without wakes, keeps the short sleep it always had.
+static uint64_t idle_budget(uint64_t until) {
+#ifdef WAKES_FOR_COMMANDS
+  if (!gx_backend->show_held) return IDLE_LONGEST_NANOSECONDS;
+  if (!gx_backend->held_due) return EMPTY_SLEEP_NANOSECONDS;
+  uint64_t now = host_nanoseconds(), budget = IDLE_LONGEST_NANOSECONDS, due = gx_backend->held_due();
+  if (due && due < now + budget) budget = due > now ? due - now : 0;
+  if (until && until < now + budget) budget = until > now ? until - now : 0;
+  return budget < 10000 ? 10000 : budget;
+#else
+  (void)until;
+  return EMPTY_SLEEP_NANOSECONDS;
+#endif
+}
+
 static void *commands_thread(void *unused) {
   (void)unused;
+  host_thread_name("gx-cmds");
+  host_perf_place(HOST_PERF_GRAPHICS);
   on_commands_thread = 1;
   stage_sample_thread(1);
 #ifdef __linux__
@@ -496,6 +525,12 @@ static void *commands_thread(void *unused) {
 #endif
   uint64_t parsed = 0;
   int empty_turns = 0;
+  static int spin_turns = -1;
+  if (spin_turns < 0) {
+    const char *asked = getenv("WII_RECOMP_GX_SPIN");
+    spin_turns = asked && *asked ? atoi(asked) : EMPTY_TURNS_BEFORE_SLEEP;
+    if (asked && *asked) fprintf(stderr, "graphics: the commands thread spins %d turns before it sleeps, as WII_RECOMP_GX_SPIN asked\n", spin_turns);
+  }
   while (1) {
     uint64_t written = atomic_load_explicit(&ring_written, memory_order_acquire);
     uint32_t used = written == parsed ? 0 : parse_one(ring + (parsed & (RING_BYTES - 1)), (uint32_t)(written - parsed));
@@ -505,11 +540,11 @@ static void *commands_thread(void *unused) {
       parsed += used;
       atomic_store_explicit(&ring_parsed, parsed, memory_order_release);
       empty_turns = 0;
-    } else if (++empty_turns < EMPTY_TURNS_BEFORE_SLEEP) {
+    } else if (++empty_turns < spin_turns) {
       sched_yield();
     } else {
       TIMELINE_BEGIN("no commands");
-      idle_wait();
+      idle_wait(idle_budget(0));
       TIMELINE_END("no commands");
     }
   }
@@ -604,7 +639,16 @@ static void hand_over(void (*work)(void *), void *argument, int soon) {
   atomic_store_explicit(&handed_waiting, 1, memory_order_release);
   wake_idle();
   uint64_t waiting_since = time_base();
+#ifdef HOST_WAIT_FUTEX
+  // The work is usually done within a few microseconds, so spin a while, then sleep until it says so
+  // rather than keep a core of a phone busy (a long peek or copy waits on the card).
+  for (int turns = 0; !atomic_load_explicit(&handed_done, memory_order_acquire); turns++) {
+    if (turns < HANDED_TURNS_BEFORE_SLEEP) sched_yield();
+    else sleeper_wait(&handed_sleeper, IDLE_LONGEST_NANOSECONDS);
+  }
+#else
   while (!atomic_load_explicit(&handed_done, memory_order_acquire)) sched_yield();
+#endif
   stage_add(STAGE_HANDED, time_base() - waiting_since);
   atomic_flag_clear_explicit(&handing, memory_order_release);
 }
@@ -818,6 +862,9 @@ void graphics_retrace(double field_rate) {
   if (field_rate > 1) atomic_store(&field_length, (uint64_t)(1e9 / field_rate));
   atomic_store(&field_began, host_nanoseconds());
   atomic_fetch_add(&fields_begun, 1);
+#ifdef WAKES_FOR_COMMANDS
+  wake_idle();  // A commands thread holding for this field goes on.
+#endif
   if (resume_state == WAITING_FOR_RETRACE) resume_state = RESUME_DUE;
   if (held_at_token && ++retraces_held >= HOLD_RETRACES_AT_MOST) token_seen = 1;
 }

@@ -14,6 +14,8 @@
 #endif
 
 #include "audio.h"
+#include "host_thread.h"
+#include "host_perf.h"
 #include "dsp.h"
 #include "console.h"
 #include "controllers.h"
@@ -97,6 +99,8 @@ static void *run(void *unused) {
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // A frame can't wait for the system's other work.
 #endif
   (void)unused;
+  host_thread_name("game");
+  host_perf_place(HOST_PERF_GAME);
 #ifdef __linux__
   // The game's thread sleeps a tenth of a millisecond at a time while it waits for the
   // graphics; the kernel's usual rounding added half as much again to each.
@@ -146,6 +150,14 @@ static void load_title_from_disc(void) {
 // to the program, so they don't depend on where it was started from.
 static void use_folders_beside(const char *program) {
   char full[PATH_MAX], path[PATH_MAX + 16];
+#ifdef __ANDROID__
+  // Inside an app the program's own path says nothing about where its folders are: the app
+  // sets each WII_RECOMP_ variable below before starting the console, and a missing one is said.
+  const char *needed[] = {"WII_RECOMP_SAVES", "WII_RECOMP_SHADER_CACHE", "WII_RECOMP_TITLE_DATA", "WII_RECOMP_CACHE"};
+  for (size_t i = 0; i < sizeof needed / sizeof *needed; i++) {
+    if (!getenv(needed[i])) fprintf(stderr, "android: %s isn't set by the app; its data goes to the working folder\n", needed[i]);
+  }
+#endif
   if (!realpath(program, full)) return;
   const char *folder = dirname(full);  // Linux's changes `full`, so it's called once.
   const char *names[][2] = {{"WII_RECOMP_SAVES", "saves"}, {"WII_RECOMP_SHADER_CACHE", "shader-cache"},
@@ -187,7 +199,21 @@ static uint64_t console_start_argument(int count, char **arguments) {
   return CONSOLE_MENU;
 }
 
+// WII_RECOMP_LOG_FILE=<path> sends what would go to stderr to that file instead, appended
+// to. An Android app has no terminal and discards stderr, so it asks for a file; it works
+// the same everywhere. A file that can't be opened is said on the stderr that remains.
+static void redirect_log(void) {
+  const char *path = getenv("WII_RECOMP_LOG_FILE");
+  if (!path || !*path) return;
+  if (!freopen(path, "a", stderr)) {
+    fprintf(stderr, "log: can't write %s, so the log stays on stderr\n", path);
+    return;
+  }
+  setvbuf(stderr, 0, _IONBF, 0);
+}
+
 int main(int count, char **arguments) {
+  redirect_log();
   // On the Mac, submitting can wait up to a second for the window to free a picture.
   // MoltenVK does that on its own thread with this off, so the game never stalls on it.
   // It reads this as it loads, which is before any window exists, so it's set first.
@@ -200,8 +226,8 @@ int main(int count, char **arguments) {
                     "       wii-recomp --console <console folder> [--boot-disc | --title <high>-<low>]\n");
     return 1;
   }
-#ifdef _WIN32
-  setenv("WII_RECOMP_SHOP_SERVER", "off", 0);  // No network on Windows yet: net_win.c.
+#if defined(_WIN32) || defined(__ANDROID__)
+  setenv("WII_RECOMP_SHOP_SERVER", "off", 0);  // No network on Windows or Android yet: net_stub.c.
   setvbuf(stderr, 0, _IONBF, 0);
 #endif
   console_remember(arguments);
@@ -240,7 +266,12 @@ int main(int count, char **arguments) {
   pads_start();  // On this thread, which the Mac's controller frameworks need, as the window does.
   if (getenv("WII_RECOMP_CONTROL")) input_start_control_pipe(getenv("WII_RECOMP_CONTROL"));
   pthread_t thread;
-  pthread_create(&thread, &attributes, run, 0);
+  int started = pthread_create(&thread, &attributes, run, 0);
+  if (started) {
+    fprintf(stderr, "stop: can't start the game's thread with a %u MiB stack (error %d)\n", STACK_BYTES >> 20, started);
+    return 10;
+  }
+  host_thread_name_unless_main("ui");  // On Android: SDL's thread, not the one the app's process started on.
   window_run();  // The Mac needs the window on this thread.
   return 0;
 }

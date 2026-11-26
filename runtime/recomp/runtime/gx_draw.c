@@ -9,6 +9,7 @@
 
 #include "debug.h"
 #include "debug.h"
+#include "gx_alpha_split.h"
 #include "gx_backend.h"
 #include "gx_inspect.h"
 #include "memory_watch.h"
@@ -34,6 +35,7 @@ static unsigned frames;
 
 int gx_scale_numerator = 2, gx_scale_denominator = 1;
 static int scale_asked;  // WII_RECOMP_SCALE set it, so a title's own doesn't.
+static int scale_refused;  // WII_RECOMP_SCALE was set to something that isn't a scale.
 
 // Read before anything is drawn, as every picture and copy is made at this size. From 1,
 // the Wii's own, to 4; 2 keeps a heavy scene within reach of a small graphics chip.
@@ -43,6 +45,7 @@ __attribute__((constructor)) static void choose_scale(void) {
   if (!asked) return;
   if (sscanf(asked, "%d/%d", &numerator, &denominator) < 1 || denominator < 1 || numerator < denominator || numerator > 4 * denominator) {
     fprintf(stderr, "WII_RECOMP_SCALE=%s isn't a scale from 1 to 4, such as 2 or 5/2, so it stays at %d\n", asked, gx_scale_numerator);
+    scale_refused = 1;
     return;
   }
   gx_scale_numerator = numerator, gx_scale_denominator = denominator;
@@ -51,9 +54,13 @@ __attribute__((constructor)) static void choose_scale(void) {
 
 // A game built with add_game.py --scale draws at its own size, unless WII_RECOMP_SCALE says otherwise.
 void gx_choose_scale(void) {
-  if (scale_asked || !title || !title->scale_numerator) return;
-  gx_scale_numerator = title->scale_numerator, gx_scale_denominator = title->scale_denominator;
-  fprintf(stderr, "picture: this game is drawn at %d/%d of the Wii's size, as it was built to be\n", gx_scale_numerator, gx_scale_denominator);
+  const char *from = scale_asked ? "WII_RECOMP_SCALE" : scale_refused ? "the default, WII_RECOMP_SCALE being refused" : "the default";
+  if (!scale_asked && title && title->scale_numerator) {
+    gx_scale_numerator = title->scale_numerator, gx_scale_denominator = title->scale_denominator;
+    from = "the scale the game was built with";
+  }
+  fprintf(stderr, "picture: the game draws at %d/%d of the Wii's size, %dx%d (from %s)\n", gx_scale_numerator, gx_scale_denominator,
+          EFB_WIDTH * gx_scale_numerator / gx_scale_denominator, EFB_HEIGHT * gx_scale_numerator / gx_scale_denominator, from);
 }
 unsigned gx_frame_number(void) { return frames; }
 
@@ -189,6 +196,9 @@ static void approximate_logic(GxRenderState *state, int mode) {
   state->blend_target = state->blend_target_alpha = table[mode].target;
 }
 
+int gx_alpha_zero_variants;
+int gx_blend_constant_alpha = -1;
+
 static void apply_blending(void) {
   // Blending reads the color stages' alpha, kept apart from the alpha that gets stored.
   static const uint8_t source_factors[8] = {GX_FACTOR_ZERO, GX_FACTOR_ONE, GX_FACTOR_TARGET_COLOR, GX_FACTOR_INVERSE_TARGET_COLOR,
@@ -254,6 +264,13 @@ static void apply_blending(void) {
       if (*factors[i] == GX_FACTOR_SOURCE1_ALPHA) *factors[i] = GX_FACTOR_SOURCE_ALPHA;
       else if (*factors[i] == GX_FACTOR_INVERSE_SOURCE1_ALPHA) *factors[i] = GX_FACTOR_INVERSE_SOURCE_ALPHA;
     }
+  }
+  // The stored alpha of 0 is the one value the blend can make in one pass beside the stages' alpha (gx_alpha_split.h), so the
+  // draw says so with its alpha factors: ZERO times anything is the 0 that the ONE/ZERO pair would give from the output's 0.
+  gx_blend_constant_alpha = constant_alpha ? (int)(gx.bp[BP_CONSTANT_ALPHA] & 255) : -1;
+  if (gx_alpha_zero_variants && constant_alpha && gx_blend_constant_alpha == 0) {
+    GxRenderState zero;
+    if (gx_alpha_zero_variant(&state, &zero)) state = zero;
   }
   gx_backend->render_state(&state);
 }
@@ -570,6 +587,51 @@ static void log_frame_rate(void) {
   second_began = now;
 }
 
+// With WII_RECOMP_GX_STATS=1, one line every ten seconds of what the graphics thread did a frame, on average:
+// draws recorded, how many were drawn twice for the alpha (no dual-source blending), strips joined into
+// a run, pipeline binds and lookups, vertices decoded by each decoder, and the time decoding and sending
+// them took (timed with a clock read around each, so it is a little more than without).
+static void report_counters(void) {
+  if (!gx_stats_wanted()) return;
+  static struct timespec began;
+  static GxCounters before;
+  static unsigned frames_before;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (!began.tv_sec) {
+    began = now, before = gx_counters, frames_before = frames;
+    return;
+  }
+  double seconds = (double)(now.tv_sec - began.tv_sec) + (now.tv_nsec - began.tv_nsec) / 1e9;
+  if (seconds < 10) return;
+  unsigned shown = frames - frames_before;
+  if (!shown) return;
+  const GxCounters *c = &gx_counters, *b = &before;
+  double n = shown;
+#define PER(field) ((double)(c->field - b->field) / n)
+  fprintf(stderr,
+          "gx: %.1fs, %u frames; per frame: draws %.0f (second alpha pass %.0f, strips joined %.0f), pipeline binds %.0f, pipeline lookups %.0f (%.0f not among the last few), "
+          "vertices %.0f (fused %.0f, planned %.0f, general %.0f; %.0f from kept lists) in %.0f draws, vertex parts %.0f indexed and %.0f direct, "
+          "vertex bytes sent %.0f, decode %.2f ms, send %.2f ms\n",
+          seconds, shown, PER(draws), PER(alpha_draws), PER(strip_joined), PER(pipeline_binds), PER(pipeline_lookups), PER(pipeline_misses),
+          PER(vertices[0]) + PER(vertices[1]) + PER(vertices[2]), PER(vertices[0]), PER(vertices[1]), PER(vertices[2]), PER(list_reused_vertices), PER(decodes),
+          PER(indexed_parts), PER(direct_parts), PER(vertex_bytes_sent), PER(decode_ns) / 1e6, PER(send_ns) / 1e6);
+  if (c->alpha_why[17] != b->alpha_why[17] || c->alpha_why[18] != b->alpha_why[18]) {
+    // Every second pass draw blends and writes alpha into a target with alpha; these say what else is true of it. See count_alpha in gx_vulkan.c.
+    fprintf(stderr,
+            "gx: alpha pass, per frame: %.0f draws with a second pass. Constant alpha 0: %.0f, 255: %.0f, other: %.0f, none: %.0f. "
+            "Colour source factor reads the stages' alpha: %.0f, colour target factor: %.0f, alpha factors: %.0f. "
+            "Factors (stage alpha, inverse): %.0f, (stage alpha, one): %.0f, (one, inverse): %.0f, other: %.0f. "
+            "Subtract: %.0f, depth write: %.0f, depth test: %.0f, colour factor reads the target's alpha: %.0f, logic operation's help: %.0f, colour write off: %.0f. "
+            "Without a second pass although the stages' alpha is read: %.0f (colour not written: %.0f, source alpha factor ZERO: %.0f, of those with a constant alpha of 0: %.0f)\n",
+            PER(alpha_why[17]), PER(alpha_why[0]), PER(alpha_why[1]), PER(alpha_why[2]), PER(alpha_why[3]), PER(alpha_why[4]), PER(alpha_why[5]), PER(alpha_why[6]),
+            PER(alpha_why[7]), PER(alpha_why[8]), PER(alpha_why[9]), PER(alpha_why[10]), PER(alpha_why[11]), PER(alpha_why[12]), PER(alpha_why[13]), PER(alpha_why[14]),
+            PER(alpha_why[15]), PER(alpha_why[16]), PER(alpha_why[18]), PER(alpha_why[19]), PER(alpha_why[20]), PER(alpha_why[21]));
+  }
+#undef PER
+  began = now, before = gx_counters, frames_before = frames;
+}
+
 void gx_present(void) {
   if (!started) start();
   gx_inspect_frame();
@@ -583,4 +645,5 @@ void gx_present(void) {
     fprintf(stderr, "frame %u: %u writes caught watching memory, list draws %u reused and %u decoded\n", frames, watch_faults(), gx_list_draws_reused, gx_list_draws_decoded);
   }
   log_frame_rate();
+  report_counters();
 }

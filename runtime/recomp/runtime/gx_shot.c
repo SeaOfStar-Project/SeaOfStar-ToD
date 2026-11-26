@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "gx_shot.h"
+#include "host_thread.h"
 #ifdef GX_WITH_VULKAN
 #include "gx_vulkan.h"
 #endif
@@ -29,6 +30,7 @@ typedef struct {
 int gx_shot_wanted(void) { return wanted[0] != 0; }
 
 static void *write_shot(void *argument) {
+  host_thread_name("shot-write");
   Shot *shot = argument;
   char temporary[sizeof shot->path + 8];
   snprintf(temporary, sizeof temporary, "%s.part", shot->path);

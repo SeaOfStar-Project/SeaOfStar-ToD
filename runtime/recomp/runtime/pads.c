@@ -63,7 +63,14 @@ void pads_start(void) {
   // SDL owns no window, so it must take controller input whichever window has focus.
   SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
   SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#ifdef __ANDROID__
+  // Android's own InputDevice path (ANDROID_JoystickDetect, every 3 s) finds Bluetooth and USB pads. HIDAPI
+  // on top of it runs a device scan on every event pump (SDL_UpdateJoysticks), which the profile showed as
+  // the largest cost of the UI thread, so it stays off here. SDL 3.4.20 has no hint for the detect interval.
+  SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+#else
   SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+#endif
   SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH, "1");
   SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "1");
   SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_JOY_CONS, "1");
@@ -79,6 +86,8 @@ void pads_start(void) {
   stats_on = getenv("WII_RECOMP_INPUT_STATS") != 0;
   started = 1;
 }
+
+void (*pads_other_event)(const void *event);
 
 double pads_wait_seconds(void) { return pad_count ? POLL_CONNECTED : POLL_IDLE; }
 
@@ -485,6 +494,7 @@ void pads_poll(void) {
     if (event.type == SDL_EVENT_GAMEPAD_ADDED) pad_added(event.gdevice.which);
     else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) pad_removed(event.gdevice.which);
     else if (event.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) sensor_sample(&event.gsensor);
+    else if (pads_other_event) pads_other_event(&event);
   }
   uint64_t now_ns = SDL_GetTicksNS(), now_ms = now_ns / 1000000;
   float seconds = last_poll_ns ? (float)(now_ns - last_poll_ns) / 1e9f : 0;

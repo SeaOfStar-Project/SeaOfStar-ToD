@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "profile.h"
+#include "host_thread.h"
 #include "title.h"
 
 enum { SAVE_EVERY_SECONDS = 10 };
@@ -130,6 +131,7 @@ void profile_save(void) {
 
 static void *keep_saving(void *unused) {
   (void)unused;
+  host_thread_name("profile-save");
   for (;;) {
     sleep(SAVE_EVERY_SECONDS);
     profile_save();

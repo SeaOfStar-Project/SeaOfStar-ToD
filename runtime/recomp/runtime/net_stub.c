@@ -1,9 +1,9 @@
-// The console's network on Windows, where net_ip.c, net_ssl.c and net_routes.c aren't
+// The console's network on Windows and Android, where net_ip.c, net_ssl.c and net_routes.c aren't
 // built yet: they use POSIX sockets, socket pairs and fork. The console has no link here
 // (main.c sets WII_RECOMP_SHOP_SERVER=off, which net.c reads as an unplugged cable), and a
 // program that opens a socket anyway is told the network can't be reached, and the
 // request is named in gaps.txt.
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 #include <stdio.h>
 #include <string.h>
 

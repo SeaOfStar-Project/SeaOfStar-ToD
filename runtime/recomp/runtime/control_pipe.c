@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "console.h"
+#include "host_thread.h"
 #include "cpu.h"
 #include "debug.h"
 #include "dsp_record.h"
@@ -275,6 +276,7 @@ static void run_command(const char *line) {
 }
 
 static void *control_loop(void *path) {
+  host_thread_name("ctl-pipe");
   // Opened for writing too, so it stays open between senders.
   FILE *pipe_file = fdopen(open(path, O_RDWR), "r");
   char line[1200];  // Room for a shot command with a long path.
@@ -295,6 +297,7 @@ static void pipe_write(const char *text) {
 }
 
 static void *control_pipe_loop(void *name) {
+  host_thread_name("ctl-pipe");
   char path[300], line[1200];
   const char *last = strrchr((const char *)name, '/');
   snprintf(path, sizeof path, "\\\\.\\pipe\\%s", last ? last + 1 : (const char *)name);

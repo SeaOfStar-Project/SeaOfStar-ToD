@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "remote_link.h"
+#include "host_thread.h"
 
 enum { NINTENDO = 0x057e, REMOTE = 0x0306, REMOTE_PLUS = 0x0330, MOST = 8, BUFFER_BYTES = 64 };
 
@@ -129,6 +130,7 @@ static CFDictionaryRef matching(int product) {
 // The HID manager must be made, used and closed on one thread, which runs its run loop.
 static void *manager_thread(void *unused) {
   (void)unused;
+  host_thread_name("remote-mgr");
   IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
   CFDictionaryRef both[2] = {matching(REMOTE), matching(REMOTE_PLUS)};
   CFArrayRef list = CFArrayCreate(kCFAllocatorDefault, (const void **)both, 2, &kCFTypeArrayCallBacks);

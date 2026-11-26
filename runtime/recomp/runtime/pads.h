@@ -10,6 +10,9 @@ void pads_poll(void);
 // How long the window's loop may wait between polls: short while a controller is
 // connected, so its motion arrives smoothly; longer with none.
 double pads_wait_seconds(void);
+// With SDL3 as the window (window_sdl.c) every event comes through the one queue the
+// controllers drain, so what isn't a controller's goes to this, as a const SDL_Event *.
+extern void (*pads_other_event)(const void *event);
 // The control pipe's controller commands, "pad add pro" and so on, which drive virtual
 // controllers through SDL, so tests go through everything a real one does. Any thread;
 // they run at the next poll. Returns 0 for a line that isn't a pad command.

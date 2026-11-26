@@ -3,8 +3,8 @@
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
-#ifndef _WIN32
-#include <ucontext.h>
+#if !defined(_WIN32) && !defined(__ANDROID__)
+#include <ucontext.h>  // Bionic has the type but not getcontext, makecontext or setcontext: Android uses its own below.
 #endif
 
 #include "cpu.h"
@@ -54,6 +54,16 @@ __attribute__((noreturn)) void context_resume(const CallerRegisters *context);
 typedef struct {
   uint64_t x19_to_x30[12], stack, d8_to_d15[8], padding;
 } CallerRegisters;
+#ifdef __ANDROID__
+// Bionic has no getcontext, makecontext or setcontext, so on Android the same record serves
+// as the host context, as on Windows: capture (like setjmp: 0, then 1 once resumed) and
+// resume, and start_on_stack below for a fresh stack. Declared here, defined further down.
+typedef CallerRegisters ucontext_t;
+__attribute__((returns_twice)) int context_capture(CallerRegisters *context);
+__attribute__((noreturn)) void context_resume(const CallerRegisters *context);
+#define getcontext(context) context_capture(context)
+#define setcontext(context) context_resume(context)
+#endif
 #elif defined(__x86_64__)
 #define RECORDS_CALLER 1
 typedef struct {
@@ -232,6 +242,45 @@ __attribute__((naked, noreturn)) static void return_to_caller(const CallerRegist
       "jmpq *%rax\n");
 }
 #else
+#ifdef __ANDROID__
+// The registers an AArch64 call must keep (x19 to x30, the stack pointer, d8 to d15), laid
+// out as CallerRegisters. Returning from here a second time, through context_resume, lands
+// where the first return went, with the stack and registers as they were.
+__attribute__((naked, returns_twice)) int context_capture(CallerRegisters *context) {
+  __asm__(
+      "stp x19, x20, [x0, #0]\n"
+      "stp x21, x22, [x0, #16]\n"
+      "stp x23, x24, [x0, #32]\n"
+      "stp x25, x26, [x0, #48]\n"
+      "stp x27, x28, [x0, #64]\n"
+      "stp x29, x30, [x0, #80]\n"
+      "mov x9, sp\n"
+      "str x9, [x0, #96]\n"
+      "stp d8, d9, [x0, #104]\n"
+      "stp d10, d11, [x0, #120]\n"
+      "stp d12, d13, [x0, #136]\n"
+      "stp d14, d15, [x0, #152]\n"
+      "mov w0, #0\n"
+      "ret\n");
+}
+__attribute__((naked, noreturn)) void context_resume(const CallerRegisters *context) {
+  __asm__(
+      "ldp x19, x20, [x0, #0]\n"
+      "ldp x21, x22, [x0, #16]\n"
+      "ldp x23, x24, [x0, #32]\n"
+      "ldp x25, x26, [x0, #48]\n"
+      "ldp x27, x28, [x0, #64]\n"
+      "ldp x29, x30, [x0, #80]\n"
+      "ldr x9, [x0, #96]\n"
+      "mov sp, x9\n"
+      "ldp d8, d9, [x0, #104]\n"
+      "ldp d10, d11, [x0, #120]\n"
+      "ldp d12, d13, [x0, #136]\n"
+      "ldp d14, d15, [x0, #152]\n"
+      "mov w0, #1\n"
+      "ret\n");
+}
+#endif
 __attribute__((naked, noreturn)) static void return_to_caller(const CallerRegisters *caller) {
   __asm__(
       "ldp x19, x20, [x0, #0]\n"
@@ -336,6 +385,35 @@ static void start_fresh(Slot *slot, uint32_t pc) {
   slot->stack = stack;
   running = slot;
   start_on_stack(top, top - FIRST_COMMIT, stack);
+}
+#elif defined(__ANDROID__)
+static void free_stack(Slot *slot) {
+  if (slot->stack && !stack_in_use(slot)) free(slot->stack);
+  slot->stack = 0;
+}
+
+// Moves to a new stack and runs thread_start there. The frame pointer and link register are
+// cleared so a backtrace ends here.
+__attribute__((naked, noreturn)) static void start_on_stack(void *top) {
+  __asm__(
+      "mov sp, x0\n"
+      "mov x29, xzr\n"
+      "mov x30, xzr\n"
+      "b thread_start\n");
+}
+
+static void start_fresh(Slot *slot, uint32_t pc) {
+  free_stack(slot);  // From an earlier thread with its context here.
+  uint8_t *stack = malloc(HOST_STACK_BYTES);  // 16-aligned, as the top of a stack must be.
+  if (!stack) {
+    fprintf(stderr, "stop: no memory for a thread's %u MiB stack\n", HOST_STACK_BYTES >> 20);
+    exit(5);
+  }
+  start_pc = pc;
+  slot->resume_pc = 0;
+  slot->stack = stack;
+  running = slot;
+  start_on_stack(stack + HOST_STACK_BYTES);
 }
 #else
 static void free_stack(Slot *slot) {

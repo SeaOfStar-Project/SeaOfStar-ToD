@@ -7,7 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
-#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+// Not on Android: the sampler's timer, signal and ucontext are glibc's, and nothing there needs it yet.
+#if defined(__linux__) && !defined(__ANDROID__) && (defined(__x86_64__) || defined(__aarch64__))
 #define SLOW_SAMPLES 1
 #include <dlfcn.h>
 #include <sched.h>
@@ -20,6 +21,7 @@
 #endif
 
 #include "cpu.h"
+#include "host_perf.h"
 #include "debug.h"
 #include "gaps.h"
 #include "gx.h"
@@ -285,9 +287,55 @@ static void samples_frame(int slow) {
 }
 #else
 volatile int stage_samples_paused;
-void stage_sample_thread(int graphics) { (void)graphics; }
+void stage_sample_thread(int graphics) {
+  (void)graphics;
+  if (getenv("WII_RECOMP_SLOW_SAMPLES")) fprintf(stderr, "slow samples: not available on this platform, so there are none\n");
+}
 static void samples_frame(int slow) { (void)slow; }
 #endif
+
+// Every ten seconds of frames, one line: how many game frames there were and how long they took, from the same gap
+// stage_frame is given (the time between the picture copies the game makes to the screen). It is the evidence for
+// "30 fps": a steady 30 shows a median and p95 near 33.3 ms and few frames over 50 ms. WII_RECOMP_FRAME_SUMMARY=0
+// turns it off and a number of seconds changes the interval.
+enum { SUMMARY_FRAMES = 8192, SUMMARY_SECONDS = 10, SUMMARY_SLOW_MS = 50 };
+
+static int by_gap(const void *a, const void *b) {
+  float x = *(const float *)a, y = *(const float *)b;
+  return (x > y) - (x < y);
+}
+
+static void frame_summary(float gap_ms) {
+  static int seconds = -1;
+  static float gaps[SUMMARY_FRAMES];
+  static unsigned count, dropped, buckets[4];
+  static double total_ms;
+  if (seconds < 0) {
+    seconds = SUMMARY_SECONDS;
+    const char *asked = getenv("WII_RECOMP_FRAME_SUMMARY");
+    if (asked && *asked) seconds = atoi(asked) > 0 ? atoi(asked) : 0;
+  }
+  if (!seconds || gap_ms <= 0) return;  // The first frame has no gap.
+  if (count < SUMMARY_FRAMES) gaps[count++] = gap_ms;
+  else dropped++;
+  buckets[gap_ms <= 36 ? 0 : gap_ms <= 45 ? 1 : gap_ms <= 55 ? 2 : 3]++;
+  total_ms += gap_ms;
+  if (total_ms < seconds * 1000.0) return;
+  unsigned slow = 0;
+  for (unsigned i = 0; i < count; i++) slow += gaps[i] > SUMMARY_SLOW_MS;
+  qsort(gaps, count, sizeof *gaps, by_gap);
+  fprintf(stderr, "frames: %u, median %.1f ms, p95 %.1f ms, max %.1f ms, over %d ms: %u", count + dropped, (double)gaps[count / 2],
+          (double)gaps[(unsigned)((count * 95ull) / 100)], (double)gaps[count - 1], SUMMARY_SLOW_MS, slow);
+  fprintf(stderr, ", <=36: %u, 36-45: %u, 45-55: %u, >55: %u", buckets[0], buckets[1], buckets[2], buckets[3]);
+  char clocks[160];
+  host_perf_clocks(clocks, sizeof clocks);
+  fputs(clocks, stderr);
+  if (dropped) fprintf(stderr, " (the statistics are of the first %u frames; %u more were counted only)", count, dropped);
+  fprintf(stderr, "\n");
+  count = dropped = 0;
+  memset(buckets, 0, sizeof buckets);
+  total_ms = 0;
+}
 
 // WII_RECOMP_FRAME_LOG=1 prints the time since the last frame shown, for each frame, so a
 // tool can tell an even 60 from frames that come in fits (recomp/tools/race_bench.py).
@@ -307,7 +355,25 @@ void stage_frame(float gap_ms) {
   static long switches_before;
   struct rusage usage;
   getrusage(RUSAGE_SELF, &usage);
-  if (gap_ms > 20) {
+  // WII_RECOMP_SLOW_FRAME_MS=<ms> prints a line for each frame that took longer than that; 0 prints none. It is 20 where
+  // a screen is steady at 60 and off on Android, where a 30 fps game would print a line for every frame, which costs the
+  // game's thread time; the frames summary below is what says how the frames went there.
+  static float slow_frame_ms = -1;
+  if (slow_frame_ms < 0) {
+#ifdef __ANDROID__
+    slow_frame_ms = 0;
+#else
+    slow_frame_ms = 20;
+#endif
+    const char *asked = getenv("WII_RECOMP_SLOW_FRAME_MS");
+    if (asked && *asked) slow_frame_ms = (float)atof(asked) > 0 ? (float)atof(asked) : 0;
+  }
+  frame_summary(gap_ms);
+  {  // The frame's work on the game's thread: the time between pictures less what it spent asleep with nothing to run.
+    uint64_t gap = (uint64_t)(gap_ms * 1e6f), idle = (uint64_t)(stage_ticks[STAGE_IDLE] * (1e9 / 60750000.0));
+    host_perf_frame(gap > idle ? gap - idle : 0);
+  }
+  if (slow_frame_ms > 0 && gap_ms > slow_frame_ms) {
     double ms = 1 / 60750.0;
     fprintf(stderr, "slow frame %.1f ms: stream %.1f, present %.1f, disc %.1f, audio %.1f, idle %.1f (longest %.1f), preempted %ld, "
             "waited for graphics %.1f (%u peeks, %u pokes, %u box reads, %u copies touched)\n",

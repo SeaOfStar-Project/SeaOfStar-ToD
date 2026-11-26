@@ -41,3 +41,7 @@ void graphics_update(void);
 void graphics_retrace(double field_rate);  // A field begins, at this many fields a second (vi.c, on the game's thread).
 int graphics_busy(void);  // Commands are still waiting to be run.
 uint64_t graphics_next_due(void);  // When the next delayed signal is due, or 0 if none is.
+
+// Wakes the game's thread if it is sleeping in its idle wait (interrupts.c): the graphics thread calls it when it
+// sets a signal (a token or draw done) that will be due. A call with nobody asleep costs a few instructions.
+void game_wake(void);

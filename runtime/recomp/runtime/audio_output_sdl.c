@@ -1,15 +1,18 @@
-// Sound output on Windows, through SDL3's default playback device, which the console
+// Sound output on Windows and Android, through SDL3's default playback device, which the console
 // already links for controllers. SDL converts from the game's sample rate and asks for
 // samples on a thread of its own.
 #include <SDL3/SDL.h>
 #include <stdio.h>
 
 #include "audio.h"
+#include "host_thread.h"
 
 #define MOST_SAMPLES 4096
 
 static void SDLCALL fill(void *unused, SDL_AudioStream *stream, int additional, int total) {
   (void)unused; (void)total;
+  static _Thread_local int named;
+  if (!named) { named = 1; host_thread_name("audio"); }  // SDL runs this on its own thread, on its first call
   static int16_t samples[MOST_SAMPLES * AUDIO_CHANNELS];
   int wanted = additional / (int)(AUDIO_CHANNELS * sizeof(int16_t));
   while (wanted > 0) {

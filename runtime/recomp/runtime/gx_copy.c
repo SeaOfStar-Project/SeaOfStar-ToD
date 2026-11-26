@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "cpu.h"
+#include "gx_debug.h"
 #include "debug.h"
 #include "gaps.h"
 #include "gx_backend.h"
@@ -762,7 +763,7 @@ void gx_copy_to_texture(uint32_t control, int from_depth) {
   if (copy->before_taken) memset(copy->before_taken, 0, copy->before_size / page_size() + 2);
   // Leaving memory as it was, for measuring what landing costs.
   static int on_card = -1;
-  if (on_card < 0) on_card = getenv("WII_RECOMP_COPIES_ON_CARD") != 0;
+  if (on_card < 0) on_card = (getenv("WII_RECOMP_COPIES_ON_CARD") != 0 || gx_debug("copiesoncard"));
   if (on_card) {
     copy->memory = MEMORY_WRITTEN;
     copy->watched = watch_range(start | 0x80000000u, end - start);

@@ -8,6 +8,7 @@ void gx_efb_send_pokes(void) {}
 void stage_add(int s, uint64_t t) {}
 const Title *title = &(Title){0};
 void poll_interrupts(void) {}
+void game_wake(void) {}
 void interrupts_turned_on(void) {}
 void stage_frame(float g) {}
 static uint8_t regs[0x10000];

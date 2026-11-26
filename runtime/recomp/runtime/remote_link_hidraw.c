@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include "remote_link.h"
+#include "host_thread.h"
 #include "remote_link_hidraw.h"
 
 enum { MOST = 8, BUFFER_BYTES = 64, BUS_BLUETOOTH_ = 5, NINTENDO = 0x057e, REMOTE = 0x0306, REMOTE_PLUS = 0x0330 };
@@ -83,6 +84,7 @@ static int device_close(void *handle, int power_off) {
 static const LinkOps ops = {device_write, device_close};
 
 static void *read_reports(void *handle) {
+  host_thread_name("hid-read");
   Device *device = handle;
   uint8_t report[BUFFER_BYTES];
   struct pollfd waiting[2] = {{device->fd, POLLIN, 0}, {device->stop, POLLIN, 0}};
@@ -183,6 +185,7 @@ static int scan(void) {
 
 static void *watch(void *unused) {
   (void)unused;
+  host_thread_name("hid-watch");
   int watcher = inotify_init1(IN_CLOEXEC);
   if (watcher < 0 || inotify_add_watch(watcher, "/dev", IN_CREATE | IN_ATTRIB) < 0) {
     fprintf(stderr, "remotes: can't watch for remotes connecting through HID: %s\n", strerror(errno));

@@ -3,6 +3,7 @@
 // by writing its registers, then reads the dots in each data report. Formats follow
 // WiiBrew and Dolphin's Camera.cpp.
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "input.h"

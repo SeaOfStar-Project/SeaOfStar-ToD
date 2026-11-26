@@ -5,7 +5,7 @@ make_disc.py <extracted folder> <image.wrd> --native <platform>=<title library> 
 
 The image holds the disc as the game and the Wii Menu read it, at its original
 offsets, plus the title's translated code for each platform it was built for, such as
-darwin-x86_64 or linux-aarch64. The console's drive reads it like a disc; a folder
+darwin-x86_64, linux-aarch64 or android-arm64. The console's drive reads it like a disc; a folder
 holding one stands in for a drive with that disc inserted, and a burned disc in a real
 drive works the same way. Nothing in it is encrypted, and it needs no keys.
 
@@ -32,7 +32,7 @@ ALIGN = 32
 BOOT_DOL_OFFSET, BOOT_FST_OFFSET = 0x420, 0x424
 BI2_AT, APPLOADER_AT = 0x440, 0x2440
 REGION_AT = 0x4e000  # The region setting in the disc's unencrypted area.
-PLATFORMS = {"darwin-x86_64", "darwin-arm64", "linux-aarch64", "linux-x86_64", "windows-x86_64"}
+PLATFORMS = {"android-arm64", "darwin-x86_64", "darwin-arm64", "linux-aarch64", "linux-x86_64", "windows-x86_64"}
 
 
 def word(data, at):

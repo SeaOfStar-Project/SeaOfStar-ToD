@@ -8,6 +8,7 @@
 #endif
 
 #include "timeline.h"
+#include "host_wait.h"
 #include "audio.h"
 #include "bluetooth.h"
 #include "title.h"
@@ -27,7 +28,16 @@
 #define TIME_BASE_HZ 60750000ull
 #define IDLE_SLEEP_TICKS (TIME_BASE_HZ / 250)  // 4 ms, the longest sleep with nothing due.
 #define NANOSECONDS 1000000000ull
+#ifdef HOST_WAIT_FUTEX
+// The graphics thread wakes the game's when it sets a signal (game_wake), so the sleep while the graphics
+// work goes on can be long: it is only for a wake that goes missing.
+#define BUSY_SLEEP_TICKS (TIME_BASE_HZ / 1000)  // 1 millisecond.
+static Sleeper game_sleeper;
+void game_wake(void) { sleeper_wake(&game_sleeper); }
+#else
 #define BUSY_SLEEP_TICKS (TIME_BASE_HZ / 10000)  // 100 microseconds.
+void game_wake(void) {}
+#endif
 #define WII_EPOCH_UNIX 946684800ll  // 2000-01-01, when the Wii's time base reads zero.
 
 #ifdef _WIN32
@@ -177,7 +187,11 @@ void idle_wait(void) {
   if (!irq_pending() && !timer_due) {
     struct timespec pause = {0, (long)(wait * NANOSECONDS / TIME_BASE_HZ)};
     TIMELINE_BEGIN("game idle");
+#ifdef HOST_WAIT_FUTEX
+    sleeper_wait(&game_sleeper, (uint64_t)pause.tv_sec * NANOSECONDS + (uint64_t)pause.tv_nsec);
+#else
     nanosleep(&pause, 0);
+#endif
     TIMELINE_END("game idle");
     stage_add(STAGE_IDLE, time_base() - now);
   }

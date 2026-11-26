@@ -1,6 +1,10 @@
 // The controller settings controllers.h describes: their defaults, the file the console
 // writes from them, reading it back, and setting the players up.
+#ifdef WII_PLATFORM_SDL
+#include "glfw_keys.h"
+#else
 #include <GLFW/glfw3.h>
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,7 +1,16 @@
 // Shaders written for what the game has set up, compiled on first use and kept by key.
 // Writing them (gx_tev.c, gx_transform.c, gx_light.c) knows no graphics API.
+#ifdef WII_PLATFORM_SDL
+#include <time.h>
+static double glfwGetTime(void) {  // Seconds from any fixed start, as GLFW's is.
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+}
+#else
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

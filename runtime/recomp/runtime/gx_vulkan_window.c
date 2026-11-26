@@ -143,7 +143,7 @@ int vk_window_show(int slot_index, const VkOffset3D from[2], const VkOffset3D to
   vk_check(vkResetFences(vk.device, 1, &slot->done), "resetting a fence");
   uint32_t image_index = 0;
   VkResult acquired = vkAcquireNextImageKHR(vk.device, vk.swapchain, 0, slot->acquired, VK_NULL_HANDLE, &image_index);
-  int outdated = acquired == VK_SUBOPTIMAL_KHR || acquired == VK_ERROR_OUT_OF_DATE_KHR;
+  int outdated = vk_swapchain_stale(acquired);
   VkPipelineStageFlags stages[2] = {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT};
   if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
     // No window picture free. The copied signal still has to be waited on before it's
@@ -175,5 +175,5 @@ int vk_window_show(int slot_index, const VkOffset3D from[2], const VkOffset3D to
                               .swapchainCount = 1, .pSwapchains = &vk.swapchain, .pImageIndices = &image_index};
   VkResult presented = vkQueuePresentKHR(vk.show_queue, &present);
   note_shown();
-  return outdated || presented == VK_SUBOPTIMAL_KHR || presented == VK_ERROR_OUT_OF_DATE_KHR;
+  return outdated || vk_swapchain_stale(presented);
 }

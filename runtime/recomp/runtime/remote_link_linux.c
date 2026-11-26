@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "remote_link.h"
+#include "host_thread.h"
 #include "remote_link_hidraw.h"
 
 // From the kernel's Bluetooth headers, so there's no library to install.
@@ -94,6 +95,7 @@ static int remote_close(void *handle, int power_off) {
 static const LinkOps ops = {remote_write, remote_close};
 
 static void *read_reports(void *handle) {
+  host_thread_name("remote-read");
   Remote *remote = handle;
   uint8_t frame[BUFFER_BYTES];
   struct pollfd waiting[2] = {{remote->interrupt, POLLIN, 0}, {remote->stop, POLLIN, 0}};
@@ -170,6 +172,7 @@ static int l2cap_listen(int psm) {
 
 static void *answer_calls(void *unused) {
   (void)unused;
+  host_thread_name("remote-call");
   int control = l2cap_listen(PSM_CONTROL), interrupt = l2cap_listen(PSM_INTERRUPT);
   if (control < 0 || interrupt < 0) {
     // In use, or not ours to take: bluetoothd's input plugin answers them, and they come
@@ -255,6 +258,7 @@ static int remote_name(int device, const BdAddress *address, const struct inquir
 
 static void *search(void *unused) {
   (void)unused;
+  host_thread_name("remote-find");
   int hci = socket(AF_BT, SOCK_RAW | SOCK_CLOEXEC, PROTO_HCI);
   struct {
     struct inquiry_request request;
